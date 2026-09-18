@@ -5,7 +5,7 @@
  * It intentionally contains no relay, toggle, or device mutation methods.
  */
 
-var TAPO_GRAFANA_VERSION = '0.2.0';
+var TAPO_GRAFANA_VERSION = '0.3.0';
 
 var TAPO_CLOUD = Object.freeze({
   initialHost: 'https://wap.tplinkcloud.com',
@@ -21,6 +21,14 @@ var TAPO_CLOUD = Object.freeze({
   mfaPath: '/api/v2/account/checkMFACodeAndLogin',
   deviceListPath: '/api/v2/common/getDeviceListByPage',
   passthroughPath: '/api/v2/common/passthrough',
+  serviceUrlPath: '/api/v2/common/getAppServiceUrlByCloudUserName',
+  thingAppType: 'Tapo_Android',
+  thingAppVersion: '3.19.607',
+  thingServiceIds: [
+    'nbu.iot-app-server.app-v2',
+    'nbu.iot-cloud-gateway.app-v2',
+    'nbu.iot-security.appdevice-v2'
+  ],
   tokenExpired: -20651,
   refreshExpired: -20655,
   mfaRequired: -20677
@@ -384,6 +392,14 @@ function getDevicesWithRefresh_(config, session) {
 }
 
 function getDevices_(config, session) {
+  try {
+    var things = getThingDevices_(config, session);
+    if (things.length) return things;
+  } catch (thingError) {
+    if (thingError instanceof TPLinkApiError_ && thingError.code === TAPO_CLOUD.tokenExpired) throw thingError;
+    console.log('Thing API device listing was unavailable; trying the legacy listing method: ' + safeError_(thingError));
+  }
+
   var devices = [];
   var index = 0;
   var limit = 100;
@@ -432,6 +448,73 @@ function getDevices_(config, session) {
   );
   assertApiSuccess_(legacyResponse, 'legacy device listing');
   return (legacyResponse.result || {}).deviceList || [];
+}
+
+/**
+ * Discover and list devices through the modern Thing API used by current Tapo
+ * applications. Current P110M firmware reports -20571 through the older cloud
+ * passthrough route even while it is online, so this is the primary route.
+ */
+function getThingDevices_(config, session) {
+  var serviceResponse = tapoPost_(
+    config,
+    session.regionalUrl,
+    TAPO_CLOUD.serviceUrlPath,
+    {
+      cloudUserName: config.tapoUsername,
+      serviceIds: TAPO_CLOUD.thingServiceIds
+    },
+    session.token,
+    session.terminalId,
+    TAPO_CLOUD.thingAppType,
+    TAPO_CLOUD.thingAppVersion
+  );
+  assertApiSuccess_(serviceResponse, 'Thing API service discovery');
+  var services = ((serviceResponse.result || {}).serviceList) || [];
+  var appServer = null;
+  services.forEach(function (service) {
+    if (service.serviceId === TAPO_CLOUD.thingServiceIds[0]) appServer = service.serviceUrl;
+  });
+  if (!appServer) throw new Error('TP-Link returned no Thing API app-server URL.');
+  appServer = normalizeThingHost_(appServer);
+
+  var devices = [];
+  var pageSize = 100;
+  for (var page = 0; page < 100; page += 1) {
+    var query = encodeQuery_({
+      page: page,
+      pageSize: pageSize,
+      includeKasaShareDevices: false,
+      includePcDevice: false,
+      includeMatterDevice: false,
+      includeExternalVendorDeviceInfo: false
+    });
+    var response = thingFetchJson_(
+      config,
+      session,
+      appServer,
+      '/v2/things?' + query,
+      'get',
+      null
+    );
+    assertThingApiSuccess_(response, 'Thing API device listing');
+    var listed = Array.isArray(response.data) ? response.data : [];
+    console.log('TP-Link Thing page ' + page + ': count=' + listed.length);
+    listed.forEach(function (thing) {
+      var device = {};
+      Object.keys(thing).forEach(function (key) { device[key] = thing[key]; });
+      device.deviceId = thing.deviceId || thing.thingName;
+      device.deviceModel = thing.deviceModel || thing.model;
+      device.deviceType = thing.deviceType || thing.category || thing.type;
+      device.alias = thing.alias || thing.nickname || thing.deviceName;
+      device.appServerUrlV2 = thing.appServerUrlV2 || appServer;
+      device._thingApi = true;
+      devices.push(device);
+    });
+    var total = numberFrom_(response, ['total']);
+    if (!listed.length || listed.length < pageSize || (total !== null && devices.length >= total)) break;
+  }
+  return devices;
 }
 
 function selectEnergyDevices_(devices, config) {
@@ -520,6 +603,9 @@ function collectCurrentEnergy_(config, session, device) {
 }
 
 function tapoPassthrough_(config, session, device, requestData) {
+  if (device._thingApi || device.thingName) {
+    return thingPassthrough_(config, session, device, requestData);
+  }
   var host = normalizeTapoHost_(device.appServerUrl || session.regionalUrl);
   var response = tapoPost_(config, host, TAPO_CLOUD.passthroughPath, {
     deviceId: device.deviceId,
@@ -534,13 +620,122 @@ function tapoPassthrough_(config, session, device, requestData) {
   return responseData;
 }
 
-function tapoPost_(config, host, path, body, token, terminalId) {
+/** Read one or more methods through the modern Thing API. */
+function thingPassthrough_(config, session, device, requestData) {
+  var thingName = device.thingName || device.deviceId;
+  if (!thingName) throw new Error('Thing API device has no thingName.');
+  var host = normalizeThingHost_(device.appServerUrlV2);
+  var output = {};
+  var errors = [];
+
+  Object.keys(requestData || {}).forEach(function (method) {
+    var params = requestData[method];
+    if (method === 'emeter') {
+      errors.push('legacy emeter is not exposed by the Thing API');
+      return;
+    }
+    var innerRequest = { method: method };
+    if (params !== null && params !== undefined) innerRequest.params = params;
+    try {
+      output[method] = thingServiceCall_(config, session, host, thingName, innerRequest);
+    } catch (error) {
+      errors.push(method + ': ' + safeError_(error));
+    }
+  });
+
+  if (!Object.keys(output).length) throw new Error(errors.join('; '));
+  return output;
+}
+
+function thingServiceCall_(config, session, host, thingName, innerRequest) {
+  var response = thingFetchJson_(
+    config,
+    session,
+    host,
+    '/v1/things/' + encodeURIComponent(String(thingName)) + '/services-sync',
+    'post',
+    {
+      serviceId: 'passthrough',
+      inputParams: { requestData: innerRequest }
+    }
+  );
+  assertThingApiSuccess_(response, 'Thing API ' + innerRequest.method);
+  var responseData = ((response.outputParams || {}).responseData);
+  if (typeof responseData === 'string') responseData = JSON.parse(responseData);
+  if (!responseData || typeof responseData !== 'object') {
+    throw new Error('Thing API returned no responseData for ' + innerRequest.method + '.');
+  }
+
+  var responses = responseData.result && responseData.result.responses;
+  if (Array.isArray(responses) && responses.length) {
+    var inner = responses[0];
+    var innerCode = Number(inner.error_code || inner.errorCode || 0);
+    if (innerCode !== 0) {
+      throw new TPLinkApiError_('Thing API ' + innerRequest.method + ' failed (' + innerCode + ').', innerCode);
+    }
+    return inner.result === undefined ? inner : inner.result;
+  }
+  var directCode = Number(responseData.error_code || responseData.errorCode || 0);
+  if (directCode !== 0) {
+    throw new TPLinkApiError_('Thing API ' + innerRequest.method + ' failed (' + directCode + ').', directCode);
+  }
+  return responseData.result === undefined ? responseData : responseData.result;
+}
+
+function thingFetchJson_(config, session, host, pathAndQuery, method, body) {
+  host = normalizeThingHost_(host);
+  var options = {
+    method: method,
+    headers: {
+      Authorization: 'ut|' + session.token,
+      'app-cid': 'app:' + TAPO_CLOUD.thingAppType + ':' + session.terminalId,
+      'x-app-name': TAPO_CLOUD.thingAppType,
+      'x-app-version': TAPO_CLOUD.thingAppVersion,
+      'x-term-id': session.terminalId,
+      'x-app-ospf': 'Android',
+      'x-app-brand': 'TPLINK'
+    },
+    // TP-Link serves this exact API from its private Cloud Root CA. Apps
+    // Script cannot install that CA; scope this exception to the strict host
+    // pattern enforced by normalizeThingHost_.
+    validateHttpsCertificates: false,
+    followRedirects: false,
+    muteHttpExceptions: true,
+    timeoutSeconds: 60
+  };
+  if (body !== null && body !== undefined) {
+    options.contentType = 'application/json;charset=UTF-8';
+    options.payload = JSON.stringify(body);
+  }
+  var response = UrlFetchApp.fetch(host + pathAndQuery, options);
+  var status = response.getResponseCode();
+  if (status < 200 || status >= 300) {
+    throw new Error('TP-Link Thing API returned HTTP ' + status + '.');
+  }
+  try {
+    return JSON.parse(response.getContentText());
+  } catch (error) {
+    throw new Error('TP-Link Thing API returned invalid JSON.');
+  }
+}
+
+function assertThingApiSuccess_(response, operation) {
+  var code = response && (response.error_code === undefined ? response.errorCode : response.error_code);
+  if (code !== undefined && code !== null && Number(code) !== 0) {
+    throw new TPLinkApiError_(
+      operation + ' failed (' + Number(code) + '): ' + sanitizeText_(response.msg || response.errorMsg || 'unknown error'),
+      Number(code)
+    );
+  }
+}
+
+function tapoPost_(config, host, path, body, token, terminalId, appName, appVersion) {
   host = normalizeTapoHost_(host);
   var payload = JSON.stringify(body);
   var signing = signingHeaders_(payload, path);
   var params = {
-    appName: TAPO_CLOUD.appType,
-    appVer: config.tapoAppVersion,
+    appName: appName || TAPO_CLOUD.appType,
+    appVer: appVersion || config.tapoAppVersion,
     netType: 'wifi',
     termID: terminalId,
     ospf: 'Android 14',
@@ -661,6 +856,15 @@ function normalizeTapoHost_(url) {
     /^https:\/\/n-([a-z0-9-]+\.tplinkcloud\.com)(:\d+)?$/i,
     'https://$1$2'
   );
+}
+
+function normalizeThingHost_(url) {
+  var normalized = String(url || '').replace(/\/+$/, '');
+  assertHttpsUrl_(normalized, 'TP-Link Thing API URL');
+  if (!/^https:\/\/[a-z0-9-]+-app-server\.iot\.i\.tplinkcloud\.com$/i.test(normalized)) {
+    throw new Error('Rejected unexpected TP-Link Thing API host.');
+  }
+  return normalized;
 }
 
 function assertHttpsUrl_(url, name) {
@@ -963,6 +1167,7 @@ if (typeof module !== 'undefined' && module.exports) {
     normalizeMfaTypes_: normalizeMfaTypes_,
     assertAllowedTapoHost_: assertAllowedTapoHost_,
     normalizeTapoHost_: normalizeTapoHost_,
+    normalizeThingHost_: normalizeThingHost_,
     selectEnergyDevices_: selectEnergyDevices_,
     selectBackfillDevices_: selectBackfillDevices_,
     deviceOnlineState_: deviceOnlineState_,
