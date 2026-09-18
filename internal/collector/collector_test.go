@@ -48,6 +48,16 @@ func TestCollectReturnsErrorWhenEveryEnergyReadFails(t *testing.T) {
 	}
 }
 
+func TestSafeErrorPreservesBoundedDiagnosticSuffix(t *testing.T) {
+	value := strings.Repeat("x", 500) + " diagnostic reason"
+	if got := safeError(value); !strings.HasSuffix(got, " diagnostic reason") {
+		t.Fatalf("diagnostic suffix was truncated: %q", got)
+	}
+	if got := safeError(strings.Repeat("x", 1100)); len(got) != 1000 {
+		t.Fatalf("safeError length = %d", len(got))
+	}
+}
+
 type fakeSink struct{ points []metric.Point }
 
 func (f *fakeSink) Push(_ context.Context, batch *metric.Batch) error {

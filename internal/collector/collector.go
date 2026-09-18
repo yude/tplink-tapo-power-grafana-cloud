@@ -73,7 +73,7 @@ func (c *Collector) Collect(ctx context.Context, includeHistory bool) (Result, e
 		for _, method := range currentMethods {
 			payload, callErr := c.tapo.Call(ctx, thing, method, nil)
 			if callErr != nil {
-				methodErrors = append(methodErrors, method+": "+safe(callErr.Error()))
+				methodErrors = append(methodErrors, method+": "+safeError(callErr.Error()))
 				continue
 			}
 			succeeded++
@@ -248,9 +248,17 @@ func deviceAttributes(thing tapo.Thing, source string) map[string]string {
 }
 
 func safe(value string) string {
+	return safeLimit(value, 200)
+}
+
+func safeError(value string) string {
+	return safeLimit(value, 1000)
+}
+
+func safeLimit(value string, limit int) string {
 	value = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(value)
-	if len(value) > 200 {
-		return value[:200]
+	if len(value) > limit {
+		return value[:limit]
 	}
 	return value
 }
