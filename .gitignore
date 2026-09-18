@@ -1,6 +1,5 @@
-.clasp.json
-.node_modules/
-node_modules/
-coverage/
 .env
-
+.clasp.json
+bin/
+coverage.out
+dist/
