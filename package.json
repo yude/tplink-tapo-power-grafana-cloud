@@ -1,0 +1,17 @@
+{
+  "name": "tapo-grafana-gas",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Read-only Tapo energy collector for Grafana Cloud on Google Apps Script",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yude/tplink-tapo-power-grafana-cloud-gas.git"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node --check Code.js && node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
