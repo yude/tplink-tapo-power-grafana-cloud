@@ -229,6 +229,9 @@ func TestCallSendsDocumentedPassthroughEnvelope(t *testing.T) {
 	if inner["method"] != "get_current_power" {
 		t.Fatalf("unexpected inner request: %#v", inner)
 	}
+	if params, ok := inner["params"].(map[string]any); !ok || len(params) != 0 {
+		t.Fatalf("parameterless read must carry an empty params object: %#v", inner)
+	}
 	for name, want := range map[string]string{
 		"App-Cid":       "app:TP-Link_Tapo_Android:00000000-0000-4000-8000-000000000001",
 		"X-App-Name":    "TP-Link_Tapo_Android",

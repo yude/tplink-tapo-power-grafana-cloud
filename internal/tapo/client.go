@@ -338,7 +338,7 @@ func (c *Client) Call(ctx context.Context, thing Thing, method string, params an
 	if err != nil {
 		return nil, err
 	}
-	inner := map[string]any{"method": method}
+	inner := map[string]any{"method": method, "params": map[string]any{}}
 	if params != nil {
 		inner["params"] = params
 	}
