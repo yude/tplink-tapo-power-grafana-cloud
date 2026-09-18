@@ -5,7 +5,7 @@
  * It intentionally contains no relay, toggle, or device mutation methods.
  */
 
-var TAPO_GRAFANA_VERSION = '0.1.5';
+var TAPO_GRAFANA_VERSION = '0.1.9';
 
 var TAPO_CLOUD = Object.freeze({
   initialHost: 'https://wap.tplinkcloud.com',
@@ -19,6 +19,7 @@ var TAPO_CLOUD = Object.freeze({
   refreshPath: '/api/v2/account/refreshToken',
   mfaEmailPath: '/api/v2/account/getEmailVC4TerminalMFA',
   mfaPath: '/api/v2/account/checkMFACodeAndLogin',
+  deviceListPath: '/api/v2/common/getDeviceListByPage',
   passthroughPath: '/api/v2/common/passthrough',
   tokenExpired: -20651,
   refreshExpired: -20655,
@@ -68,7 +69,7 @@ function runCollection() {
 
     devices.forEach(function (device) {
       addDeviceOnlineMetric_(batch, device);
-      if (Number(device.status) !== 1) {
+      if (deviceOnlineState_(device) === false && !config.includeOffline) {
         addCollectionMetric_(batch, device, false);
         failed += 1;
         return;
@@ -89,7 +90,10 @@ function runCollection() {
     });
 
     if (batch.pointCount === 0) {
-      throw new Error('No metrics were produced. Check the device filter and device availability.');
+      throw new Error(
+        'No metrics were produced. Device selection diagnostics: ' +
+        JSON.stringify(deviceSelectionDiagnostics_(devicesResult.devices, devices, config))
+      );
     }
     pushMetricBatch_(config, batch);
     return {
@@ -116,9 +120,7 @@ function backfillEnergyHistory() {
     var session = getOrCreateSession_(config);
     var devicesResult = getDevicesWithRefresh_(config, session);
     session = devicesResult.session;
-    var devices = selectEnergyDevices_(devicesResult.devices, config).filter(function (device) {
-      return Number(device.status) === 1;
-    });
+    var devices = selectBackfillDevices_(devicesResult.devices, config);
     var batch = newMetricBatch_(Date.now());
     var now = new Date();
 
@@ -132,7 +134,10 @@ function backfillEnergyHistory() {
     });
 
     if (batch.pointCount === 0) {
-      throw new Error('No historical energy points were available from the selected devices.');
+      throw new Error(
+        'No historical energy points were available. Device selection diagnostics: ' +
+        JSON.stringify(deviceSelectionDiagnostics_(devicesResult.devices, devices, config))
+      );
     }
     pushMetricBatch_(config, batch);
     return { devicesSelected: devices.length, pointsSent: batch.pointCount };
@@ -151,6 +156,17 @@ function validateConfiguration() {
     deviceFilterCount: config.deviceIds.length,
     validatesTpLinkHttpsCertificates: !config.allowInsecureTls
   };
+}
+
+/** Return non-identifying discovery details for troubleshooting device selection. */
+function diagnoseDeviceDiscovery() {
+  var config = getConfig_();
+  var session = getOrCreateSession_(config);
+  var result = getDevicesWithRefresh_(config, session);
+  var selected = selectEnergyDevices_(result.devices, config);
+  var diagnostics = deviceSelectionDiagnostics_(result.devices, selected, config);
+  console.log(JSON.stringify(diagnostics));
+  return diagnostics;
 }
 
 /**
@@ -373,19 +389,108 @@ function getDevicesWithRefresh_(config, session) {
 }
 
 function getDevices_(config, session) {
-  var response = tapoPost_(config, session.regionalUrl, '/', { method: 'getDeviceList' }, session.token, session.terminalId);
-  assertApiSuccess_(response, 'device listing');
-  return (response.result || {}).deviceList || [];
+  var devices = [];
+  var index = 0;
+  var limit = 100;
+  var deviceTypes = [
+    'SMART.TAPOPLUG',
+    'SMART.TAPOBULB',
+    'SMART.IPCAMERA',
+    'SMART.TAPOROBOVAC',
+    'SMART.TAPOHUB',
+    'SMART.TAPOSENSOR',
+    'SMART.TAPOSWITCH'
+  ];
+
+  try {
+    for (var pageNumber = 0; pageNumber < 100; pageNumber += 1) {
+      var response = tapoPost_(config, session.regionalUrl, TAPO_CLOUD.deviceListPath, {
+        deviceTypeList: deviceTypes,
+        index: index,
+        limit: limit
+      }, session.token, session.terminalId);
+      assertApiSuccess_(response, 'device listing');
+      var result = response.result || {};
+      var page = Array.isArray(result.deviceList) ? result.deviceList : [];
+      console.log(
+        'TP-Link device page ' + pageNumber + ': count=' + page.length +
+        ', resultKeys=' + Object.keys(result).sort().join(',')
+      );
+      devices = devices.concat(page);
+      var total = numberFrom_(result, ['total', 'totalNum', 'sum']);
+      if (!page.length || page.length < limit || (total !== null && devices.length >= total)) break;
+      index += page.length;
+    }
+    if (devices.length) return devices;
+  } catch (error) {
+    if (error instanceof TPLinkApiError_ && error.code === TAPO_CLOUD.tokenExpired) throw error;
+    console.log('V2 device listing was unavailable; trying the legacy listing method: ' + safeError_(error));
+  }
+
+  var legacyResponse = tapoPost_(
+    config,
+    session.regionalUrl,
+    '/',
+    { method: 'getDeviceList' },
+    session.token,
+    session.terminalId
+  );
+  assertApiSuccess_(legacyResponse, 'legacy device listing');
+  return (legacyResponse.result || {}).deviceList || [];
 }
 
 function selectEnergyDevices_(devices, config) {
   return devices.filter(function (device) {
     if (config.deviceIds.length && config.deviceIds.indexOf(String(device.deviceId)) === -1) return false;
-    if (!config.includeOffline && Number(device.status) !== 1) return false;
-    var kind = String(device.deviceType || '').toUpperCase();
-    var model = String(device.deviceModel || '').toUpperCase();
+    var kind = deviceKind_(device).toUpperCase();
+    var model = deviceModel_(device).toUpperCase();
     return /PLUG|SWITCH|STRIP/.test(kind) || /^(P|KP|EP|HS)/.test(model);
   });
+}
+
+function selectBackfillDevices_(devices, config) {
+  return selectEnergyDevices_(devices, config).filter(function (device) {
+    return deviceOnlineState_(device) !== false;
+  });
+}
+
+function deviceKind_(device) {
+  return String(device.deviceType || device.device_type || device.type || device.category || '');
+}
+
+function deviceModel_(device) {
+  return String(device.deviceModel || device.device_model || device.model || device.productModel || '');
+}
+
+function deviceOnlineState_(device) {
+  var value = device.status;
+  if (value === undefined || value === null) value = device.deviceStatus;
+  if (value === undefined || value === null) value = device.online;
+  if (value === undefined || value === null) return null;
+  if (value === true || Number(value) === 1) return true;
+  if (value === false || Number(value) === 0) return false;
+  var text = String(value).toLowerCase();
+  if (text === 'online' || text === 'connected') return true;
+  if (text === 'offline' || text === 'disconnected') return false;
+  return null;
+}
+
+function deviceSelectionDiagnostics_(discovered, selected, config) {
+  return {
+    discoveredCount: discovered.length,
+    selectedCount: selected.length,
+    configuredDeviceIdCount: config.deviceIds.length,
+    includeOfflinePolling: config.includeOffline,
+    devices: discovered.slice(0, 50).map(function (device) {
+      var state = deviceOnlineState_(device);
+      return {
+        type: sanitizeText_(deviceKind_(device) || 'unknown'),
+        model: sanitizeText_(deviceModel_(device) || 'unknown'),
+        online: state === null ? 'unknown' : state,
+        selected: selected.indexOf(device) !== -1
+      };
+    })
+  };
 }
 
 function collectCurrentEnergy_(config, session, device) {
@@ -596,15 +701,17 @@ function deviceAttributes_(device, source) {
   var attributes = {
     'tapo.device.id': String(device.deviceId || 'unknown'),
     'tapo.device.name': safeDeviceName_(device),
-    'tapo.device.model': String(device.deviceModel || 'unknown')
+    'tapo.device.model': deviceModel_(device) || 'unknown'
   };
   if (source) attributes['tapo.data.source'] = source;
   return attributes;
 }
 
 function addDeviceOnlineMetric_(batch, device) {
+  var online = deviceOnlineState_(device);
+  if (online === null) return;
   addMetricPoint_(batch, 'tapo_device_online', '1', 'Whether TP-Link Cloud reports the device online',
-    Number(device.status) === 1 ? 1 : 0, deviceAttributes_(device), batch.timestampMs);
+    online ? 1 : 0, deviceAttributes_(device), batch.timestampMs);
 }
 
 function addCollectionMetric_(batch, device, success) {
@@ -735,7 +842,11 @@ function collectSmartHistoryWindow_(config, session, device, window, batch) {
     var payload;
     try {
       payload = tapoPassthrough_(config, session, device, request);
-    } catch (ignored) {
+    } catch (error) {
+      console.log(
+        'Smart history unavailable for ' + safeDeviceName_(device) +
+        ' (' + window.resolution + '): ' + safeError_(error)
+      );
       return;
     }
     var result = payload.get_energy_data || payload;
@@ -774,12 +885,16 @@ function collectLegacyHistory_(config, session, device, now, batch) {
     dayPayload = tapoPassthrough_(config, session, device, {
       emeter: { get_daystat: { year: now.getFullYear(), month: now.getMonth() + 1 } }
     });
-  } catch (ignoredDay) {}
+  } catch (dayError) {
+    console.log('Legacy daily history unavailable for ' + safeDeviceName_(device) + ': ' + safeError_(dayError));
+  }
   try {
     monthPayload = tapoPassthrough_(config, session, device, {
       emeter: { get_monthstat: { year: now.getFullYear() } }
     });
-  } catch (ignoredMonth) {}
+  } catch (monthError) {
+    console.log('Legacy monthly history unavailable for ' + safeDeviceName_(device) + ': ' + safeError_(monthError));
+  }
   var days = ((((dayPayload || {}).emeter || {}).get_daystat || {}).day_list) || [];
   days.forEach(function (item) {
     var value = numberFrom_(item, ['energy_wh', 'energy']);
@@ -858,9 +973,13 @@ if (typeof module !== 'undefined' && module.exports) {
     assertAllowedTapoHost_: assertAllowedTapoHost_,
     normalizeTapoHost_: normalizeTapoHost_,
     selectEnergyDevices_: selectEnergyDevices_,
+    selectBackfillDevices_: selectBackfillDevices_,
+    deviceOnlineState_: deviceOnlineState_,
+    deviceSelectionDiagnostics_: deviceSelectionDiagnostics_,
     runCollection: runCollection,
     initializeTapoSession: initializeTapoSession,
     completeTapoMfa: completeTapoMfa,
+    diagnoseDeviceDiscovery: diagnoseDeviceDiscovery,
     validateConfiguration: validateConfiguration
   };
 }
