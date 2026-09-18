@@ -5,10 +5,10 @@
  * It intentionally contains no relay, toggle, or device mutation methods.
  */
 
-var TAPO_GRAFANA_VERSION = '0.1.1';
+var TAPO_GRAFANA_VERSION = '0.1.3';
 
 var TAPO_CLOUD = Object.freeze({
-  initialHost: 'https://n-wap.i.tplinkcloud.com',
+  initialHost: 'https://wap.tplinkcloud.com',
   appType: 'TP-Link_Tapo_Android',
   appVersion: '3.4.451',
   accessKey: '4d11b6b9d5ea4d19a829adbb9714b057',
@@ -137,9 +137,10 @@ function validateConfiguration() {
   var config = getConfig_();
   return {
     valid: true,
+    tapoInitialHost: config.tapoInitialHost,
     grafanaMetricsUrl: config.grafanaMetricsUrl,
     deviceFilterCount: config.deviceIds.length,
-    insecureTpLinkTlsExplicitlyAllowed: config.allowInsecureTls
+    validatesTpLinkHttpsCertificates: !config.allowInsecureTls
   };
 }
 
@@ -201,17 +202,11 @@ function getConfig_() {
   assertHttpsUrl_(metricsUrl, 'GRAFANA_OTLP_ENDPOINT');
 
   var allowInsecureTls = p.getProperty('TAPO_ALLOW_INSECURE_TLS') === 'true';
-  if (!allowInsecureTls) {
-    throw new Error(
-      'TAPO_ALLOW_INSECURE_TLS=true is required because the current Tapo cloud chain is not trusted by UrlFetchApp. ' +
-      'Read the security warning in README.md before opting in.'
-    );
-  }
 
   return {
     tapoUsername: requiredProperty_(p, 'TAPO_USERNAME'),
     tapoPassword: requiredProperty_(p, 'TAPO_PASSWORD'),
-    tapoInitialHost: (p.getProperty('TAPO_CLOUD_HOST') || TAPO_CLOUD.initialHost).replace(/\/+$/, ''),
+    tapoInitialHost: normalizeTapoHost_(p.getProperty('TAPO_CLOUD_HOST') || TAPO_CLOUD.initialHost),
     tapoAppVersion: p.getProperty('TAPO_APP_VERSION') || TAPO_CLOUD.appVersion,
     allowInsecureTls: allowInsecureTls,
     grafanaMetricsUrl: metricsUrl,
@@ -257,8 +252,7 @@ function login_(config) {
     cloudUserName: config.tapoUsername
   }, null, terminalId);
   assertApiSuccess_(statusResponse, 'regional endpoint discovery');
-  var regionalUrl = ((statusResponse.result || {}).appServerUrl || config.tapoInitialHost).replace(/\/+$/, '');
-  assertAllowedTapoHost_(regionalUrl);
+  var regionalUrl = normalizeTapoHost_((statusResponse.result || {}).appServerUrl || config.tapoInitialHost);
 
   var loginResponse = tapoPost_(config, regionalUrl, TAPO_CLOUD.loginPath, {
     appType: TAPO_CLOUD.appType,
@@ -382,8 +376,7 @@ function collectCurrentEnergy_(config, session, device) {
 }
 
 function tapoPassthrough_(config, session, device, requestData) {
-  var host = String(device.appServerUrl || session.regionalUrl).replace(/\/+$/, '');
-  assertAllowedTapoHost_(host);
+  var host = normalizeTapoHost_(device.appServerUrl || session.regionalUrl);
   var response = tapoPost_(config, host, TAPO_CLOUD.passthroughPath, {
     deviceId: device.deviceId,
     requestData: JSON.stringify(requestData)
@@ -398,7 +391,7 @@ function tapoPassthrough_(config, session, device, requestData) {
 }
 
 function tapoPost_(config, host, path, body, token, terminalId) {
-  assertAllowedTapoHost_(host);
+  host = normalizeTapoHost_(host);
   var payload = JSON.stringify(body);
   var signing = signingHeaders_(payload, path);
   var params = {
@@ -423,7 +416,7 @@ function tapoPost_(config, host, path, body, token, terminalId) {
       'X-Authorization': signing.authorization
     },
     payload: payload,
-    validateHttpsCertificates: false,
+    validateHttpsCertificates: !config.allowInsecureTls,
     followRedirects: false,
     muteHttpExceptions: true,
     timeoutSeconds: 60
@@ -498,6 +491,21 @@ function assertAllowedTapoHost_(url) {
   var allowed = host === 'tplinkcloud.com' || host.endsWith('.tplinkcloud.com') ||
     host === 'tplinknbu.com' || host.endsWith('.tplinknbu.com');
   if (!allowed) throw new Error('Rejected unexpected TP-Link API host: ' + host);
+}
+
+/**
+ * TP-Link's discovery API can return an `n-` gateway whose certificate chains
+ * to a private TP-Link root. The otherwise identical hostname without `n-`
+ * presents a publicly trusted certificate. Only rewrite that exact regional
+ * tplinkcloud.com pattern; all other hosts still pass through the allowlist.
+ */
+function normalizeTapoHost_(url) {
+  var normalized = String(url).replace(/\/+$/, '');
+  assertAllowedTapoHost_(normalized);
+  return normalized.replace(
+    /^https:\/\/n-([a-z0-9-]+\.tplinkcloud\.com)(:\d+)?$/i,
+    'https://$1$2'
+  );
 }
 
 function assertHttpsUrl_(url, name) {
@@ -790,6 +798,7 @@ if (typeof module !== 'undefined' && module.exports) {
     pushMetricBatch_: pushMetricBatch_,
     apiErrorCode_: apiErrorCode_,
     assertAllowedTapoHost_: assertAllowedTapoHost_,
+    normalizeTapoHost_: normalizeTapoHost_,
     selectEnergyDevices_: selectEnergyDevices_,
     runCollection: runCollection,
     validateConfiguration: validateConfiguration
