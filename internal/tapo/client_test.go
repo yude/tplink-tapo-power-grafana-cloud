@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"log/slog"
@@ -175,5 +176,44 @@ func TestDoJSONRedactsQueryParameters(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "https://example.invalid/path") {
 		t.Fatalf("safe request URL missing from error: %v", err)
+	}
+}
+
+func TestCallSendsDirectPassthroughRequest(t *testing.T) {
+	var requestBody map[string]any
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(
+				`{"error_code":0,"outputParams":{"responseData":{"error_code":0,"result":{"current_power":1250}}}}`,
+			)),
+			Header: make(http.Header),
+		}, nil
+	})}
+	client := &Client{
+		terminalID: "00000000-0000-4000-8000-000000000001",
+		thingHTTP:  httpClient,
+		session:    &session{Token: "secret-token"},
+	}
+	result, err := client.Call(context.Background(), Thing{
+		ThingName:      "thing-1",
+		AppServerURLV2: "https://aps1-app-server.iot.i.tplinkcloud.com",
+	}, "get_current_power", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["current_power"] != float64(1250) {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	inputParams, _ := requestBody["inputParams"].(map[string]any)
+	requestData, _ := inputParams["requestData"].(map[string]any)
+	if requestData["method"] != "get_current_power" {
+		t.Fatalf("unexpected requestData: %#v", requestData)
+	}
+	if _, wrapped := requestData["params"]; wrapped {
+		t.Fatalf("parameterless method was unexpectedly wrapped: %#v", requestData)
 	}
 }

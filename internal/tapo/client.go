@@ -345,10 +345,7 @@ func (c *Client) Call(ctx context.Context, thing Thing, method string, params an
 	body := map[string]any{
 		"serviceId": "passthrough",
 		"inputParams": map[string]any{
-			"requestData": map[string]any{
-				"method": "multipleRequest",
-				"params": map[string]any{"requests": []any{inner}},
-			},
+			"requestData": inner,
 		},
 	}
 	var response map[string]any
