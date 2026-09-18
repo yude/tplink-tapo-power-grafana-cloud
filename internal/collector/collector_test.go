@@ -14,7 +14,6 @@ import (
 )
 
 type fakeTapo struct {
-	methods []string
 	failAll bool
 }
 
@@ -24,12 +23,18 @@ func (f *fakeTapo) ListThings(context.Context) ([]tapo.Thing, error) {
 	}}, nil
 }
 
-func (f *fakeTapo) Call(_ context.Context, _ tapo.Thing, method string, _ any) (map[string]any, error) {
-	f.methods = append(f.methods, method)
-	if method == "get_energy_usage" && !f.failAll {
-		return map[string]any{"current_power": float64(1250), "today_energy": float64(10)}, nil
+func (f *fakeTapo) ReadUsage(_ context.Context, _ tapo.Thing) (map[string]any, error) {
+	if !f.failAll {
+		return map[string]any{"energy_usage": map[string]any{"current_power": float64(1250), "today_energy": float64(10)}}, nil
 	}
-	return nil, errors.New("unsupported")
+	return nil, errors.New("usage unavailable")
+}
+
+func (f *fakeTapo) ReadShadow(_ context.Context, _ tapo.Thing) (map[string]any, error) {
+	if !f.failAll {
+		return map[string]any{"on": true}, nil
+	}
+	return nil, errors.New("shadow unavailable")
 }
 
 func TestCollectReturnsErrorWhenEveryEnergyReadFails(t *testing.T) {
@@ -88,10 +93,5 @@ func TestCollectNormalizesPowerAndNeverMutatesDevices(t *testing.T) {
 	}
 	if !powerFound || !onlineFound {
 		t.Fatalf("expected metrics not found: %#v", sink.points)
-	}
-	for _, method := range api.methods {
-		if method == "set_device_info" || method == "set_relay_state" || method == "turn_on" || method == "turn_off" {
-			t.Fatalf("mutation method called: %s", method)
-		}
 	}
 }

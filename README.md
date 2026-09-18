@@ -28,14 +28,13 @@ TLS 証明書とホスト名を検証します。証明書検証を無効化す�
 
 ## 収集内容
 
-選択したプラグごとに、対応している次の読み取りメソッドを呼び出します。
+選択したプラグごとに、Cloud Thing API の読み取り専用 endpoint を呼び出します。
 
-- `get_energy_usage`: 当日・当月の積算電力量、稼働時間、現在電力
-- `get_current_power`: 現在電力
-- `get_emeter_data`: 電圧、電流、現在電力など
-- `get_emeter_vgain_igain`: 電力計測用ゲイン値
-- `get_device_usage`: 当日・7 日・30 日の利用統計
-- `get_energy_data`: 時間・日・月単位の履歴
+- `GET /v1/things/{thingName}/usage`: 当日・当月の積算電力量、稼働時間、現在電力、時間・日・月単位の履歴
+- `GET /v1/things/shadows?thingNames=...`: デバイスが報告した現在状態
+
+デバイスコマンドを中継する `services-sync` は使用しません。shadow は `desired` ではなく
+デバイス自身が返した `reported` だけを参照し、変更 API は実装していません。
 
 既知の値は SI 単位へ正規化します。未知の数値フィールドも捨てず、フィールドの
 JSON パスを `tapo.energy.field` 属性に持つ `tapo_energy_raw_value` として送信します。
@@ -50,6 +49,7 @@ JSON パスを `tapo.energy.field` 属性に持つ `tapo_energy_raw_value` と�
 | `tapo_energy_total_watt_hours` | Wh | 総積算電力量 |
 | `tapo_runtime_today_seconds` | s | 当日の稼働時間 |
 | `tapo_runtime_month_seconds` | s | 当月の稼働時間 |
+| `tapo_power_bucket_watts` | W | 時間別の平均電力 |
 | `tapo_energy_bucket_watt_hours` | Wh | 履歴バケット |
 | `tapo_device_online` | 1 | 少なくとも 1 つの読み取りが成功したか |
 | `tapo_energy_collection_success` | 1 | 電力収集の成功状態 |

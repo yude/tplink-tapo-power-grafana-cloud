@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"io"
 	"log/slog"
@@ -93,15 +92,6 @@ func TestAPIErrorCodeReadsNestedResult(t *testing.T) {
 	}
 }
 
-func TestClientRejectsDeviceControlMethods(t *testing.T) {
-	client := &Client{}
-	for _, method := range []string{"set_device_info", "device_on", "device_off", "toggle"} {
-		if _, err := client.Call(context.Background(), Thing{}, method, nil); err == nil {
-			t.Fatalf("expected %q to be rejected", method)
-		}
-	}
-}
-
 func TestAuthenticateLogsMFATransitionsWithoutSecrets(t *testing.T) {
 	responses := []string{
 		`{"error_code":0,"result":{"appServerUrl":"https://aps1-wap-gw.tplinkcloud.com"}}`,
@@ -184,18 +174,17 @@ func TestDoJSONRedactsQueryParameters(t *testing.T) {
 	}
 }
 
-func TestCallSendsDocumentedPassthroughEnvelope(t *testing.T) {
-	var requestBody map[string]any
+func TestReadUsageUsesDedicatedReadOnlyEndpoint(t *testing.T) {
 	var requestHeaders http.Header
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		requestHeaders = request.Header.Clone()
-		if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil {
-			t.Fatal(err)
+		if request.Method != http.MethodGet || request.URL.Path != "/v1/things/thing-1/usage" {
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL)
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Body: io.NopCloser(strings.NewReader(
-				`{"error_code":0,"outputParams":{"responseData":{"error_code":0,"result":{"current_power":1250}}}}`,
+				`{"energy_usage":{"current_power":1250,"today_energy":10}}`,
 			)),
 			Header: make(http.Header),
 		}, nil
@@ -205,32 +194,16 @@ func TestCallSendsDocumentedPassthroughEnvelope(t *testing.T) {
 		thingHTTP:  httpClient,
 		session:    &session{Token: "secret-token"},
 	}
-	result, err := client.Call(context.Background(), Thing{
+	result, err := client.ReadUsage(context.Background(), Thing{
 		ThingName:      "thing-1",
 		AppServerURLV2: "https://aps1-app-server.iot.i.tplinkcloud.com",
-	}, "get_current_power", nil)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result["current_power"] != float64(1250) {
+	energy, _ := result["energy_usage"].(map[string]any)
+	if energy["current_power"] != float64(1250) {
 		t.Fatalf("unexpected result: %#v", result)
-	}
-	inputParams, _ := requestBody["inputParams"].(map[string]any)
-	requestData, _ := inputParams["requestData"].(map[string]any)
-	if requestData["method"] != "multipleRequest" {
-		t.Fatalf("unexpected requestData: %#v", requestData)
-	}
-	params, _ := requestData["params"].(map[string]any)
-	requests, _ := params["requests"].([]any)
-	if len(requests) != 1 {
-		t.Fatalf("unexpected request envelope: %#v", requestData)
-	}
-	inner, _ := requests[0].(map[string]any)
-	if inner["method"] != "get_current_power" {
-		t.Fatalf("unexpected inner request: %#v", inner)
-	}
-	if params, ok := inner["params"].(map[string]any); !ok || len(params) != 0 {
-		t.Fatalf("parameterless read must carry an empty params object: %#v", inner)
 	}
 	for name, want := range map[string]string{
 		"App-Cid":       "app:TP-Link_Tapo_Android:00000000-0000-4000-8000-000000000001",
@@ -247,5 +220,37 @@ func TestCallSendsDocumentedPassthroughEnvelope(t *testing.T) {
 	}
 	if strings.Contains(requestHeaders.Get("User-Agent"), "secret-token") {
 		t.Fatal("token leaked into User-Agent")
+	}
+}
+
+func TestReadShadowReturnsOnlyReportedState(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet || request.URL.Path != "/v1/things/shadows" || request.URL.Query().Get("thingNames") != "thing-1" {
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(
+				`{"shadows":[{"thingName":"thing-1","version":12,"state":{"desired":{"on":false},"reported":{"on":true,"power_mw":2300}}}]}`,
+			)),
+			Header: make(http.Header),
+		}, nil
+	})}
+	client := &Client{
+		terminalID: "00000000-0000-4000-8000-000000000001",
+		thingHTTP:  httpClient,
+		session:    &session{Token: "secret-token"},
+	}
+	reported, err := client.ReadShadow(context.Background(), Thing{
+		ThingName: "thing-1", AppServerURLV2: "https://aps1-app-server.iot.i.tplinkcloud.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reported["on"] != true || reported["power_mw"] != float64(2300) {
+		t.Fatalf("unexpected reported state: %#v", reported)
+	}
+	if _, leaked := reported["desired"]; leaked {
+		t.Fatalf("desired state leaked into reported data: %#v", reported)
 	}
 }

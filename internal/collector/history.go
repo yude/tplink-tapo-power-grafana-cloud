@@ -1,91 +1,93 @@
 package collector
 
 import (
-	"context"
+	"strings"
 	"time"
 
 	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/metric"
 	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/tapo"
 )
 
-type historyWindow struct {
-	Resolution      string
-	IntervalMinutes int
-	Start           time.Time
-	End             time.Time
+var usageHistoryFields = map[string]struct{}{
+	"past24h": {}, "past7d": {}, "past30d": {}, "past1y": {},
 }
 
-func (c *Collector) collectHistory(ctx context.Context, batch *metric.Batch, thing tapo.Thing, now time.Time) {
-	for _, window := range historyWindows(now) {
-		if err := c.collectHistoryWindow(ctx, batch, thing, window); err != nil {
-			c.logger.Debug("Tapo energy history unavailable", "device", safe(thing.Name()), "resolution", window.Resolution, "error", safe(err.Error()))
+func historyField(path []string) bool {
+	for _, component := range path {
+		if _, ok := usageHistoryFields[strings.ToLower(component)]; ok {
+			return true
 		}
 	}
+	return false
 }
 
-func (c *Collector) collectHistoryWindow(ctx context.Context, batch *metric.Batch, thing tapo.Thing, window historyWindow) error {
-	requestedEnd := window.End.Unix()
-	nextStart := window.Start.Unix()
-	seen := make(map[int64]struct{})
-	for page := 0; page < 12 && nextStart < requestedEnd; page++ {
-		payload, err := c.tapo.Call(ctx, thing, "get_energy_data", map[string]any{
-			"start_timestamp": nextStart,
-			"end_timestamp":   requestedEnd,
-			"interval":        window.IntervalMinutes,
+func (c *Collector) collectUsageHistory(batch *metric.Batch, thing tapo.Thing, usage map[string]any, fallback time.Time) {
+	energy := usage
+	if nested, ok := usage["energy_usage"].(map[string]any); ok {
+		energy = nested
+	}
+	anchor := usageLocalTime(energy, fallback.In(c.location))
+	addPowerHistory(batch, thing, "past24h", flattenNumbers(energy["past24h"]), anchor)
+	addPowerHistory(batch, thing, "past7d", flattenNumbers(energy["past7d"]), anchor)
+	addEnergyHistory(batch, thing, "past30d", flattenNumbers(energy["past30d"]), anchor)
+	addEnergyHistory(batch, thing, "past1y", flattenNumbers(energy["past1y"]), anchor)
+}
+
+func addPowerHistory(batch *metric.Batch, thing tapo.Thing, window string, values []float64, anchor time.Time) {
+	if len(values) == 0 {
+		return
+	}
+	end := time.Date(anchor.Year(), anchor.Month(), anchor.Day()+1, 0, 0, 0, 0, anchor.Location())
+	for index, value := range values {
+		attributes := historyAttributes(thing, window, "hourly")
+		batch.Add(metric.Point{
+			Name: "tapo_power_bucket_watts", Unit: "W", Description: "Average power in a historical hourly bucket",
+			Value: value, Timestamp: end.Add(-time.Duration(len(values)-index) * time.Hour), Attributes: attributes,
 		})
-		if err != nil {
-			return err
-		}
-		data, ok := payload["data"].([]any)
-		if !ok || len(data) == 0 {
-			return nil
-		}
-		pageStart := int64Number(payload["start_timestamp"], nextStart)
-		for index, raw := range data {
-			value, ok := floatNumber(raw)
-			if !ok {
-				continue
-			}
-			timestamp := historyTimestamp(pageStart, window, index)
-			if _, duplicate := seen[timestamp.UnixNano()]; duplicate {
-				continue
-			}
-			seen[timestamp.UnixNano()] = struct{}{}
-			attributes := deviceAttributes(thing, "thing_history")
-			attributes["tapo.energy.resolution"] = window.Resolution
-			batch.Add(metric.Point{
-				Name: "tapo_energy_bucket_watt_hours", Unit: "Wh",
-				Description: "Energy consumed in a historical time bucket",
-				Value:       value, Timestamp: timestamp, Attributes: attributes,
-			})
-		}
-		returnedEnd := int64Number(payload["end_timestamp"], requestedEnd)
-		if returnedEnd <= nextStart || returnedEnd >= requestedEnd {
-			return nil
-		}
-		nextStart = returnedEnd
-	}
-	return nil
-}
-
-func historyWindows(now time.Time) []historyWindow {
-	year, month, day := now.Date()
-	location := now.Location()
-	startOfDay := time.Date(year, month, day, 0, 0, 0, 0, location)
-	quarterMonth := time.Month(((int(month)-1)/3)*3 + 1)
-	return []historyWindow{
-		{Resolution: "hourly", IntervalMinutes: 60, Start: startOfDay, End: startOfDay.AddDate(0, 0, 1)},
-		{Resolution: "daily", IntervalMinutes: 1440, Start: time.Date(year, quarterMonth, 1, 0, 0, 0, 0, location), End: time.Date(year, quarterMonth, 1, 0, 0, 0, 0, location).AddDate(0, 3, 0)},
-		{Resolution: "monthly", IntervalMinutes: 43200, Start: time.Date(year, 1, 1, 0, 0, 0, 0, location), End: time.Date(year+1, 1, 1, 0, 0, 0, 0, location)},
 	}
 }
 
-func historyTimestamp(start int64, window historyWindow, index int) time.Time {
-	base := time.Unix(start, 0).In(window.Start.Location())
-	if window.Resolution == "monthly" {
-		return time.Date(base.Year(), base.Month(), 1, 0, 0, 0, 0, base.Location()).AddDate(0, index, 0)
+func addEnergyHistory(batch *metric.Batch, thing tapo.Thing, window string, values []float64, anchor time.Time) {
+	if len(values) == 0 {
+		return
 	}
-	return time.Unix(start+int64(index*window.IntervalMinutes*60), 0).In(window.Start.Location())
+	for index, value := range values {
+		var timestamp time.Time
+		resolution := "daily"
+		if window == "past1y" {
+			resolution = "monthly"
+			timestamp = time.Date(anchor.Year(), anchor.Month(), 1, 0, 0, 0, 0, anchor.Location()).AddDate(0, -(len(values) - index - 1), 0)
+		} else {
+			timestamp = time.Date(anchor.Year(), anchor.Month(), anchor.Day(), 0, 0, 0, 0, anchor.Location()).AddDate(0, 0, -(len(values) - index - 1))
+		}
+		batch.Add(metric.Point{
+			Name: "tapo_energy_bucket_watt_hours", Unit: "Wh", Description: "Energy consumed in a historical time bucket",
+			Value: value, Timestamp: timestamp, Attributes: historyAttributes(thing, window, resolution),
+		})
+	}
+}
+
+func historyAttributes(thing tapo.Thing, window, resolution string) map[string]string {
+	attributes := deviceAttributes(thing, "thing_usage_history")
+	attributes["tapo.energy.window"] = window
+	attributes["tapo.energy.resolution"] = resolution
+	return attributes
+}
+
+func usageLocalTime(energy map[string]any, fallback time.Time) time.Time {
+	text, _ := energy["local_time"].(string)
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339} {
+		if parsed, err := time.ParseInLocation(layout, text, fallback.Location()); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func flattenNumbers(value any) []float64 {
+	values := make([]float64, 0)
+	walkNumbers(value, nil, func(_ []string, number float64) { values = append(values, number) })
+	return values
 }
 
 func floatNumber(value any) (float64, bool) {
@@ -99,11 +101,4 @@ func floatNumber(value any) (float64, bool) {
 	default:
 		return 0, false
 	}
-}
-
-func int64Number(value any, fallback int64) int64 {
-	if number, ok := floatNumber(value); ok {
-		return int64(number)
-	}
-	return fallback
 }

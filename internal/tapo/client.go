@@ -31,14 +31,6 @@ var (
 	//go:embed tplink-cloud-server-ca.pem
 	tpLinkCloudServerCA []byte
 	thingHostSuffix     = "-app-server.iot.i.tplinkcloud.com"
-	readOnlyMethods     = map[string]struct{}{
-		"get_current_power":      {},
-		"get_device_usage":       {},
-		"get_emeter_data":        {},
-		"get_emeter_vgain_igain": {},
-		"get_energy_data":        {},
-		"get_energy_usage":       {},
-	}
 )
 
 type MFACodeProvider interface {
@@ -327,67 +319,57 @@ func (c *Client) ListThings(ctx context.Context) ([]Thing, error) {
 	return things, nil
 }
 
-func (c *Client) Call(ctx context.Context, thing Thing, method string, params any) (map[string]any, error) {
-	if _, allowed := readOnlyMethods[method]; !allowed {
-		return nil, fmt.Errorf("rejected non-read-only Tapo method %q", method)
-	}
-	if c.session == nil {
-		return nil, errors.New("TP-Link session is not initialized")
+func (c *Client) ReadUsage(ctx context.Context, thing Thing) (map[string]any, error) {
+	if err := c.Authenticate(ctx); err != nil {
+		return nil, err
 	}
 	host, err := normalizeThingHost(thing.AppServerURLV2)
 	if err != nil {
 		return nil, err
 	}
-	inner := map[string]any{"method": method, "params": map[string]any{}}
-	if params != nil {
-		inner["params"] = params
-	}
-	body := map[string]any{
-		"serviceId": "passthrough",
-		"inputParams": map[string]any{
-			"requestData": map[string]any{
-				"method": "multipleRequest",
-				"params": map[string]any{"requests": []any{inner}},
-			},
-		},
-	}
 	var response map[string]any
-	endpoint := host + "/v1/things/" + url.PathEscape(thing.ID()) + "/services-sync"
-	if err := c.thingJSON(ctx, http.MethodPost, endpoint, body, &response); err != nil {
+	endpoint := host + "/v1/things/" + url.PathEscape(thing.ID()) + "/usage"
+	if err := c.thingJSON(ctx, http.MethodGet, endpoint, nil, &response); err != nil {
 		return nil, err
 	}
 	if code := apiCode(response); code != 0 {
-		return nil, &APIError{Operation: "Thing API " + method, Code: code, Message: messageFrom(response)}
+		return nil, &APIError{Operation: "Thing usage API", Code: code, Message: messageFrom(response)}
 	}
-	responseData := valueAt(response, "outputParams", "responseData")
-	if text, ok := responseData.(string); ok {
-		if err := json.Unmarshal([]byte(text), &responseData); err != nil {
-			return nil, fmt.Errorf("decode Thing API responseData: %w", err)
-		}
-	}
-	data, ok := responseData.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("Thing API %s returned no responseData", method)
-	}
-	responses := sliceAt(data, "result", "responses")
-	if len(responses) == 0 {
-		if code := apiCode(data); code != 0 {
-			return nil, &APIError{Operation: "Thing API " + method, Code: code, Message: messageFrom(data)}
-		}
-		if result, ok := data["result"].(map[string]any); ok {
-			return result, nil
-		}
+	if data, ok := response["data"].(map[string]any); ok {
 		return data, nil
 	}
-	first, _ := responses[0].(map[string]any)
-	if code := apiCode(first); code != 0 {
-		return nil, &APIError{Operation: "Thing API " + method, Code: code, Message: messageFrom(first)}
+	return response, nil
+}
+
+func (c *Client) ReadShadow(ctx context.Context, thing Thing) (map[string]any, error) {
+	if err := c.Authenticate(ctx); err != nil {
+		return nil, err
 	}
-	result, ok := first["result"].(map[string]any)
+	host, err := normalizeThingHost(thing.AppServerURLV2)
+	if err != nil {
+		return nil, err
+	}
+	query := url.Values{"thingNames": {thing.ID()}}.Encode()
+	var response map[string]any
+	if err := c.thingJSON(ctx, http.MethodGet, host+"/v1/things/shadows?"+query, nil, &response); err != nil {
+		return nil, err
+	}
+	if code := apiCode(response); code != 0 {
+		return nil, &APIError{Operation: "Thing shadow API", Code: code, Message: messageFrom(response)}
+	}
+	shadows := sliceAt(response, "shadows")
+	if len(shadows) == 0 {
+		return nil, errors.New("Thing shadow API returned no shadow")
+	}
+	shadow, ok := shadows[0].(map[string]any)
 	if !ok {
-		return map[string]any{}, nil
+		return nil, errors.New("Thing shadow API returned an invalid shadow")
 	}
-	return result, nil
+	reported, ok := valueAt(shadow, "state", "reported").(map[string]any)
+	if !ok {
+		return nil, errors.New("Thing shadow API returned no reported state")
+	}
+	return reported, nil
 }
 
 func (c *Client) signedPost(ctx context.Context, client *http.Client, host, path string, body map[string]any, token, appName, appVersion string) (map[string]any, error) {

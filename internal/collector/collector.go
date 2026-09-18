@@ -15,17 +15,10 @@ import (
 	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/tapo"
 )
 
-var currentMethods = []string{
-	"get_energy_usage",
-	"get_current_power",
-	"get_emeter_data",
-	"get_emeter_vgain_igain",
-	"get_device_usage",
-}
-
 type TapoClient interface {
 	ListThings(context.Context) ([]tapo.Thing, error)
-	Call(context.Context, tapo.Thing, string, any) (map[string]any, error)
+	ReadUsage(context.Context, tapo.Thing) (map[string]any, error)
+	ReadShadow(context.Context, tapo.Thing) (map[string]any, error)
 }
 
 type Sink interface {
@@ -68,27 +61,30 @@ func (c *Collector) Collect(ctx context.Context, includeHistory bool) (Result, e
 	var batch metric.Batch
 	result := Result{DevicesSelected: len(selected)}
 	for _, thing := range selected {
-		succeeded := 0
-		methodErrors := make([]string, 0, len(currentMethods))
-		for _, method := range currentMethods {
-			payload, callErr := c.tapo.Call(ctx, thing, method, nil)
-			if callErr != nil {
-				methodErrors = append(methodErrors, method+": "+safeError(callErr.Error()))
-				continue
+		pointsBefore := batch.Len()
+		readErrors := make([]string, 0, 2)
+		usage, usageErr := c.tapo.ReadUsage(ctx, thing)
+		if usageErr != nil {
+			readErrors = append(readErrors, "usage: "+safeError(usageErr.Error()))
+		} else {
+			c.extract(&batch, thing, "thing_usage", usage, now, true)
+			if includeHistory {
+				c.collectUsageHistory(&batch, thing, usage, now)
 			}
-			succeeded++
-			c.extract(&batch, thing, "thing", map[string]any{method: payload}, now)
 		}
-		if succeeded > 0 {
+		shadow, shadowErr := c.tapo.ReadShadow(ctx, thing)
+		if shadowErr != nil {
+			readErrors = append(readErrors, "shadow: "+safeError(shadowErr.Error()))
+		} else {
+			c.extract(&batch, thing, "thing_shadow", shadow, now, false)
+		}
+		if batch.Len() > pointsBefore {
 			result.DevicesSucceeded++
 			c.statusMetrics(&batch, thing, now, true)
 		} else {
 			result.DevicesFailed++
 			c.statusMetrics(&batch, thing, now, false)
-			c.logger.Error("Tapo energy collection failed", "device", safe(thing.Name()), "method_errors", methodErrors)
-		}
-		if includeHistory {
-			c.collectHistory(ctx, &batch, thing, now)
+			c.logger.Error("Tapo energy collection failed", "device", safe(thing.Name()), "read_errors", readErrors)
 		}
 	}
 	if batch.Len() == 0 {
@@ -138,8 +134,11 @@ func (c *Collector) statusMetrics(batch *metric.Batch, thing tapo.Thing, timesta
 	})
 }
 
-func (c *Collector) extract(batch *metric.Batch, thing tapo.Thing, source string, payload map[string]any, timestamp time.Time) {
+func (c *Collector) extract(batch *metric.Batch, thing tapo.Thing, source string, payload map[string]any, timestamp time.Time, includeRaw bool) {
 	walkNumbers(payload, nil, func(path []string, value float64) {
+		if historyField(path) {
+			return
+		}
 		leaf := strings.ToLower(path[len(path)-1])
 		switch leaf {
 		case "err_code", "error_code", "start_timestamp", "end_timestamp", "local_time", "interval", "year", "month", "day":
@@ -149,6 +148,9 @@ func (c *Collector) extract(batch *metric.Batch, thing tapo.Thing, source string
 		point.Timestamp = timestamp
 		point.Attributes = deviceAttributes(thing, source)
 		if !ok {
+			if !includeRaw {
+				return
+			}
 			point = metric.Point{
 				Name: "tapo_energy_raw_value", Unit: "1",
 				Description: "Unnormalized numeric value returned by a Tapo energy API",
@@ -174,7 +176,7 @@ func normalize(path []string, value float64) (metric.Point, bool) {
 		return normalized("tapo_current_amperes", "A", "RMS current", value), true
 	case leaf == "power_mw":
 		return normalized("tapo_power_watts", "W", "Instantaneous active power", value/1000), true
-	case leaf == "current_power" && strings.Contains(joined, "get_energy_usage"):
+	case leaf == "current_power" && strings.Contains(joined, "energy_usage"):
 		return normalized("tapo_power_watts", "W", "Instantaneous active power", value/1000), true
 	case leaf == "current_power" || leaf == "power":
 		return normalized("tapo_power_watts", "W", "Instantaneous active power", value), true
