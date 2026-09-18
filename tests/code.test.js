@@ -384,6 +384,42 @@ test('current P110M devices use the modern Thing API instead of offline legacy p
   assert.equal(calls.some((call) => call.url.includes('/v1/things/thing-1/services-sync')), true);
 });
 
+test('Thing API TLS failure stops before emitting false offline metrics', () => {
+  const calls = [];
+  const thingHost = 'https://aps1-app-server.iot.i.tplinkcloud.com';
+  propertyValues.set('_TAPO_SESSION_JSON', JSON.stringify({
+    regionalUrl: 'https://aps1-wap-gw.tplinkcloud.com',
+    terminalId: 'terminal-1',
+    token: 'token',
+    refreshToken: 'refresh'
+  }));
+  fetchHandler = (url, options) => {
+    calls.push({ url, options });
+    if (url.includes('/api/v2/common/getAppServiceUrlByCloudUserName')) {
+      return response(200, {
+        error_code: 0,
+        result: {
+          serviceList: [{
+            serviceId: 'nbu.iot-app-server.app-v2',
+            serviceUrl: thingHost
+          }]
+        }
+      });
+    }
+    if (url.startsWith(`${thingHost}/v2/things?`)) {
+      throw new Error(`Exception: SSL Error [${url}]`);
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  assert.throws(
+    () => app.runCollection(),
+    /cannot establish TLS.*private CA.*stopped without falling back/i
+  );
+  assert.equal(calls.some((call) => call.url.includes('/api/v2/common/getDeviceListByPage')), false);
+  assert.equal(calls.some((call) => call.url.includes('otlp.example.invalid')), false);
+});
+
 test('source contains no device mutation command methods', () => {
   const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'Code.js'), 'utf8');
   assert.doesNotMatch(source, /['"](?:set_relay_state|turn_on|turn_off|toggle|set_device_info)['"]/);

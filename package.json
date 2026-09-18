@@ -1,6 +1,6 @@
 {
   "name": "tapo-grafana-gas",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Read-only Tapo energy collector for Grafana Cloud on Google Apps Script",
   "repository": {

@@ -19,10 +19,12 @@ Tapoクラウドには、公開信頼証明書を返すホストと、TP-Link独
 HTTPS証明書を既定で検証します。地域判定APIが`n-`で始まる独自CA側の
 ゲートウェイを返した場合は、同一地域の公開信頼証明書側ホストへ正規化します。
 ただし、現行P110Mが使うThing APIはTP-Link独自CAの
-`https://<region>-app-server.iot.i.tplinkcloud.com`でしか提供されません。この経路に
-限って`validateHttpsCertificates: false`を使用します。接続先は上記の厳密なホスト名
-パターンで検査し、API応答から任意ホストへ誘導されないようにしています。GASでは
-TP-Link独自CAを追加・固定できないため、これは純粋なGAS実装上避けられない制約です。
+`https://<region>-app-server.iot.i.tplinkcloud.com`でしか提供されません。接続先を上記の
+厳密なホスト名パターンに制限し、`validateHttpsCertificates: false`も指定していますが、
+現在のUrlFetchAppはこのホストとのTLSハンドシェイク自体を`SSL Error`で拒否します。
+公開CA側の同等APIホストも存在しないため、現時点で純粋なGASだけからP110MのThing API
+へ接続することはできません。v0.3.1以降は、この場合に旧APIへフォールバックして
+オンライン機器を誤ってオフラインと記録せず、制約を明示するエラーで停止します。
 次の運用も強く推奨します。
 
 - 普段利用するTP-Link IDとは分離した、Tapo専用IDを使用する。

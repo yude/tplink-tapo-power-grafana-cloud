@@ -5,7 +5,7 @@
  * It intentionally contains no relay, toggle, or device mutation methods.
  */
 
-var TAPO_GRAFANA_VERSION = '0.3.0';
+var TAPO_GRAFANA_VERSION = '0.3.1';
 
 var TAPO_CLOUD = Object.freeze({
   initialHost: 'https://wap.tplinkcloud.com',
@@ -56,6 +56,14 @@ function TPLinkTerminalVerificationRequired_(message) {
 }
 TPLinkTerminalVerificationRequired_.prototype = Object.create(Error.prototype);
 TPLinkTerminalVerificationRequired_.prototype.constructor = TPLinkTerminalVerificationRequired_;
+
+function TPLinkThingTlsUnsupported_(message) {
+  this.name = 'TPLinkThingTlsUnsupported';
+  this.message = message;
+  this.stack = new Error(message).stack;
+}
+TPLinkThingTlsUnsupported_.prototype = Object.create(Error.prototype);
+TPLinkThingTlsUnsupported_.prototype.constructor = TPLinkThingTlsUnsupported_;
 
 /** Entry point for the installable time trigger. */
 function runCollection() {
@@ -397,6 +405,10 @@ function getDevices_(config, session) {
     if (things.length) return things;
   } catch (thingError) {
     if (thingError instanceof TPLinkApiError_ && thingError.code === TAPO_CLOUD.tokenExpired) throw thingError;
+    // Do not reinterpret a GAS TLS limitation as four offline devices. The
+    // legacy route returns -20571 for current P110M firmware and would emit
+    // false tapo_device_online=0 samples for devices that are actually online.
+    if (thingError instanceof TPLinkThingTlsUnsupported_) throw thingError;
     console.log('Thing API device listing was unavailable; trying the legacy listing method: ' + safeError_(thingError));
   }
 
@@ -707,7 +719,18 @@ function thingFetchJson_(config, session, host, pathAndQuery, method, body) {
     options.contentType = 'application/json;charset=UTF-8';
     options.payload = JSON.stringify(body);
   }
-  var response = UrlFetchApp.fetch(host + pathAndQuery, options);
+  var response;
+  try {
+    response = UrlFetchApp.fetch(host + pathAndQuery, options);
+  } catch (error) {
+    if (/SSL Error/i.test(String(error && error.message ? error.message : error))) {
+      throw new TPLinkThingTlsUnsupported_(
+        'Google Apps Script cannot establish TLS with the TP-Link Thing API private CA. ' +
+        'Collection stopped without falling back to the legacy route because that route falsely reports current P110M devices offline.'
+      );
+    }
+    throw error;
+  }
   var status = response.getResponseCode();
   if (status < 200 || status >= 300) {
     throw new Error('TP-Link Thing API returned HTTP ' + status + '.');
