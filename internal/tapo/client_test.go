@@ -159,8 +159,10 @@ func TestDoJSONRedactsQueryParameters(t *testing.T) {
 	httpClient := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusUnauthorized,
-			Body:       io.NopCloser(strings.NewReader(`{}`)),
-			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"status":400,"message":"missing appCid","token":"secret-response-token"}`,
+			)),
+			Header: make(http.Header),
 		}, nil
 	})}
 	request, err := http.NewRequest(http.MethodGet, "https://example.invalid/path?token=secret-token", nil)
@@ -171,15 +173,18 @@ func TestDoJSONRedactsQueryParameters(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected HTTP status error")
 	}
-	if strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "?token") {
+	if strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "?token") || strings.Contains(err.Error(), "secret-response-token") {
 		t.Fatalf("query parameter leaked in error: %v", err)
 	}
 	if !strings.Contains(err.Error(), "https://example.invalid/path") {
 		t.Fatalf("safe request URL missing from error: %v", err)
 	}
+	if !strings.Contains(err.Error(), "status=400") || !strings.Contains(err.Error(), "message=missing appCid") {
+		t.Fatalf("safe error details missing: %v", err)
+	}
 }
 
-func TestCallSendsDirectPassthroughRequest(t *testing.T) {
+func TestCallSendsDocumentedPassthroughEnvelope(t *testing.T) {
 	var requestBody map[string]any
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil {
@@ -210,10 +215,16 @@ func TestCallSendsDirectPassthroughRequest(t *testing.T) {
 	}
 	inputParams, _ := requestBody["inputParams"].(map[string]any)
 	requestData, _ := inputParams["requestData"].(map[string]any)
-	if requestData["method"] != "get_current_power" {
+	if requestData["method"] != "multipleRequest" {
 		t.Fatalf("unexpected requestData: %#v", requestData)
 	}
-	if _, wrapped := requestData["params"]; wrapped {
-		t.Fatalf("parameterless method was unexpectedly wrapped: %#v", requestData)
+	params, _ := requestData["params"].(map[string]any)
+	requests, _ := params["requests"].([]any)
+	if len(requests) != 1 {
+		t.Fatalf("unexpected request envelope: %#v", requestData)
+	}
+	inner, _ := requests[0].(map[string]any)
+	if inner["method"] != "get_current_power" {
+		t.Fatalf("unexpected inner request: %#v", inner)
 	}
 }

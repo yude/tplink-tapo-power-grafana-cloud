@@ -345,7 +345,10 @@ func (c *Client) Call(ctx context.Context, thing Thing, method string, params an
 	body := map[string]any{
 		"serviceId": "passthrough",
 		"inputParams": map[string]any{
-			"requestData": inner,
+			"requestData": map[string]any{
+				"method": "multipleRequest",
+				"params": map[string]any{"requests": []any{inner}},
+			},
 		},
 	}
 	var response map[string]any
@@ -456,6 +459,7 @@ func (c *Client) thingJSON(ctx context.Context, method, endpoint string, body an
 	req.Header.Set("x-term-id", c.terminalID)
 	req.Header.Set("x-app-ospf", "Android")
 	req.Header.Set("x-app-brand", "TPLINK")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	return doJSON(c.thingHTTP, req, target)
 }
@@ -475,12 +479,44 @@ func doJSON(client *http.Client, req *http.Request, target any) error {
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("%s %s returned HTTP %d", req.Method, requestURL(req), response.StatusCode)
+		return fmt.Errorf("%s %s returned HTTP %d%s", req.Method, requestURL(req), response.StatusCode, httpErrorDetails(body))
 	}
 	if err := json.Unmarshal(body, target); err != nil {
 		return fmt.Errorf("decode %s %s response: %w", req.Method, requestURL(req), err)
 	}
 	return nil
+}
+
+func httpErrorDetails(body []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	details := make([]string, 0, 4)
+	for _, key := range []string{"status", "code", "error_code", "errorCode", "error", "message", "msg", "errorMsg"} {
+		value, exists := payload[key]
+		if !exists {
+			continue
+		}
+		var text string
+		switch typed := value.(type) {
+		case string:
+			text = typed
+		case float64:
+			text = strconv.FormatFloat(typed, 'f', -1, 64)
+		default:
+			continue
+		}
+		text = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(text)
+		if len(text) > 200 {
+			text = text[:200]
+		}
+		details = append(details, key+"="+text)
+	}
+	if len(details) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(details, ", ") + ")"
 }
 
 func requestURL(req *http.Request) string {
