@@ -5,7 +5,7 @@
  * It intentionally contains no relay, toggle, or device mutation methods.
  */
 
-var TAPO_GRAFANA_VERSION = '0.1.0';
+var TAPO_GRAFANA_VERSION = '0.1.1';
 
 var TAPO_CLOUD = Object.freeze({
   initialHost: 'https://n-wap.i.tplinkcloud.com',
@@ -138,33 +138,9 @@ function validateConfiguration() {
   return {
     valid: true,
     grafanaMetricsUrl: config.grafanaMetricsUrl,
-    intervalMinutes: config.intervalMinutes,
     deviceFilterCount: config.deviceIds.length,
     insecureTpLinkTlsExplicitlyAllowed: config.allowInsecureTls
   };
-}
-
-/** Create exactly one time-driven collection trigger. */
-function setupTrigger() {
-  var config = getConfig_();
-  removeTriggers();
-  ScriptApp.newTrigger('runCollection')
-    .timeBased()
-    .everyMinutes(config.intervalMinutes)
-    .create();
-  return { installed: true, everyMinutes: config.intervalMinutes };
-}
-
-/** Remove only triggers owned by this application. */
-function removeTriggers() {
-  var removed = 0;
-  ScriptApp.getProjectTriggers().forEach(function (trigger) {
-    if (trigger.getHandlerFunction() === 'runCollection') {
-      ScriptApp.deleteTrigger(trigger);
-      removed += 1;
-    }
-  });
-  return { removed: removed };
 }
 
 /**
@@ -213,11 +189,6 @@ function initializeTapoSession() {
 
 function getConfig_() {
   var p = PropertiesService.getScriptProperties();
-  var interval = Number(p.getProperty('COLLECTION_INTERVAL_MINUTES') || '5');
-  if ([1, 5, 10, 15, 30].indexOf(interval) === -1) {
-    throw new Error('COLLECTION_INTERVAL_MINUTES must be one of 1, 5, 10, 15, or 30.');
-  }
-
   var endpoint = requiredProperty_(p, 'GRAFANA_OTLP_ENDPOINT').replace(/\/+$/, '');
   var metricsUrl;
   if (/\/v1\/metrics$/.test(endpoint)) {
@@ -246,7 +217,6 @@ function getConfig_() {
     grafanaMetricsUrl: metricsUrl,
     grafanaInstanceId: requiredProperty_(p, 'GRAFANA_OTLP_INSTANCE_ID'),
     grafanaToken: requiredProperty_(p, 'GRAFANA_CLOUD_TOKEN'),
-    intervalMinutes: interval,
     deviceIds: splitCsv_(p.getProperty('TAPO_DEVICE_IDS') || ''),
     includeOffline: p.getProperty('TAPO_INCLUDE_OFFLINE') === 'true'
   };
