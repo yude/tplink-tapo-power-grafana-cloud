@@ -5,7 +5,7 @@
  * It intentionally contains no relay, toggle, or device mutation methods.
  */
 
-var TAPO_GRAFANA_VERSION = '0.1.3';
+var TAPO_GRAFANA_VERSION = '0.1.5';
 
 var TAPO_CLOUD = Object.freeze({
   initialHost: 'https://wap.tplinkcloud.com',
@@ -17,6 +17,7 @@ var TAPO_CLOUD = Object.freeze({
   accountStatusPath: '/api/v2/account/getAccountStatusAndUrl',
   loginPath: '/api/v2/account/login',
   refreshPath: '/api/v2/account/refreshToken',
+  mfaEmailPath: '/api/v2/account/getEmailVC4TerminalMFA',
   mfaPath: '/api/v2/account/checkMFACodeAndLogin',
   passthroughPath: '/api/v2/common/passthrough',
   tokenExpired: -20651,
@@ -38,6 +39,14 @@ function TPLinkApiError_(message, code) {
 }
 TPLinkApiError_.prototype = Object.create(Error.prototype);
 TPLinkApiError_.prototype.constructor = TPLinkApiError_;
+
+function TPLinkTerminalVerificationRequired_(message) {
+  this.name = 'TPLinkTerminalVerificationRequired';
+  this.message = message;
+  this.stack = new Error(message).stack;
+}
+TPLinkTerminalVerificationRequired_.prototype = Object.create(Error.prototype);
+TPLinkTerminalVerificationRequired_.prototype.constructor = TPLinkTerminalVerificationRequired_;
 
 /** Entry point for the installable time trigger. */
 function runCollection() {
@@ -165,10 +174,11 @@ function completeTapoMfa() {
     var pending = JSON.parse(pendingText);
     var body = {
       appType: TAPO_CLOUD.appType,
-      cloudPassword: config.tapoPassword,
       cloudUserName: config.tapoUsername,
       code: code,
-      terminalUUID: pending.terminalId
+      MFAProcessId: pending.mfaProcessId,
+      MFAType: pending.mfaType,
+      terminalBindEnabled: true
     };
     var response = tapoPost_(config, pending.regionalUrl, TAPO_CLOUD.mfaPath, body, null, pending.terminalId);
     assertApiSuccess_(response, 'MFA verification');
@@ -184,8 +194,19 @@ function completeTapoMfa() {
 /** Start a new login explicitly; useful during first-time setup. */
 function initializeTapoSession() {
   clearSession_();
-  getOrCreateSession_(getConfig_());
-  return { authenticated: true };
+  try {
+    getOrCreateSession_(getConfig_());
+    return { authenticated: true, terminalVerificationRequired: false };
+  } catch (error) {
+    if (!(error instanceof TPLinkTerminalVerificationRequired_)) throw error;
+    console.log(error.message);
+    return {
+      authenticated: false,
+      terminalVerificationRequired: true,
+      delivery: 'email',
+      nextFunction: 'completeTapoMfa'
+    };
+  }
 }
 
 function getConfig_() {
@@ -269,11 +290,36 @@ function login_(config) {
 
   var code = apiErrorCode_(loginResponse);
   if (code === TAPO_CLOUD.mfaRequired) {
+    var loginResult = loginResponse.result || {};
+    var processId = loginResult.MFAProcessId || loginResult.mfaProcessId;
+    if (!processId) {
+      throw new Error('TP-Link requested terminal verification but returned no MFA process ID.');
+    }
+    var supportedTypes = normalizeMfaTypes_(loginResult.supportedMFATypes || loginResult.supportedMfaTypes || []);
+    if (supportedTypes.length && supportedTypes.indexOf(2) === -1) {
+      throw new Error(
+        'TP-Link requested terminal verification, but email verification is not available. Supported types: ' +
+        supportedTypes.join(', ')
+      );
+    }
+    var mfaType = 2;
+    var sendResponse = tapoPost_(config, regionalUrl, TAPO_CLOUD.mfaEmailPath, {
+      appType: TAPO_CLOUD.appType,
+      cloudPassword: config.tapoPassword,
+      cloudUserName: config.tapoUsername,
+      terminalUUID: terminalId
+    }, null, terminalId);
+    assertApiSuccess_(sendResponse, 'email terminal verification code request');
     properties.setProperty(INTERNAL_PROPERTIES.pendingMfa, JSON.stringify({
       regionalUrl: regionalUrl,
-      terminalId: terminalId
+      terminalId: terminalId,
+      mfaProcessId: processId,
+      mfaType: mfaType
     }));
-    throw new Error('TP-Link MFA is required. Set TAPO_MFA_CODE, then run completeTapoMfa().');
+    throw new TPLinkTerminalVerificationRequired_(
+      'TP-Link requires verification for this new terminal even if account 2-step verification is disabled. ' +
+      'A verification code was requested by email. Set TAPO_MFA_CODE, then run completeTapoMfa().'
+    );
   }
   assertApiSuccess_(loginResponse, 'TP-Link login');
   var session = sessionFromLoginResult_(regionalUrl, terminalId, loginResponse.result || {});
@@ -470,6 +516,17 @@ function apiErrorCode_(response) {
   if (outer) return outer;
   var inner = response && response.result && response.result.errorCode;
   return inner === undefined || inner === null ? 0 : Number(inner);
+}
+
+function normalizeMfaTypes_(types) {
+  if (!Array.isArray(types)) return [];
+  return types.map(function (value) {
+    var normalized = String(value).toLowerCase();
+    if (normalized === 'email') return 2;
+    if (normalized === 'push') return 1;
+    var numeric = Number(value);
+    return isFinite(numeric) ? numeric : null;
+  }).filter(function (value) { return value !== null; });
 }
 
 function assertApiSuccess_(response, operation) {
@@ -797,10 +854,13 @@ if (typeof module !== 'undefined' && module.exports) {
     newMetricBatch_: newMetricBatch_,
     pushMetricBatch_: pushMetricBatch_,
     apiErrorCode_: apiErrorCode_,
+    normalizeMfaTypes_: normalizeMfaTypes_,
     assertAllowedTapoHost_: assertAllowedTapoHost_,
     normalizeTapoHost_: normalizeTapoHost_,
     selectEnergyDevices_: selectEnergyDevices_,
     runCollection: runCollection,
+    initializeTapoSession: initializeTapoSession,
+    completeTapoMfa: completeTapoMfa,
     validateConfiguration: validateConfiguration
   };
 }
