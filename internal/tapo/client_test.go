@@ -1,12 +1,23 @@
 package tapo
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
 
 func TestNormalizePublicHost(t *testing.T) {
 	tests := map[string]string{
@@ -87,5 +98,82 @@ func TestClientRejectsDeviceControlMethods(t *testing.T) {
 		if _, err := client.Call(context.Background(), Thing{}, method, nil); err == nil {
 			t.Fatalf("expected %q to be rejected", method)
 		}
+	}
+}
+
+func TestAuthenticateLogsMFATransitionsWithoutSecrets(t *testing.T) {
+	responses := []string{
+		`{"error_code":0,"result":{"appServerUrl":"https://aps1-wap-gw.tplinkcloud.com"}}`,
+		`{"error_code":-20677,"result":{"MFAProcessId":"secret-process"}}`,
+		`{"error_code":0}`,
+		`{"error_code":0,"result":{"token":"secret-token","refreshToken":"secret-refresh"}}`,
+	}
+	requestIndex := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		if requestIndex >= len(responses) {
+			t.Fatal("unexpected extra HTTP request")
+		}
+		response := responses[requestIndex]
+		requestIndex++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(response)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	var logs bytes.Buffer
+	client := &Client{
+		username: "private@example.invalid", password: "secret-password",
+		terminalID:  "00000000-0000-4000-8000-000000000001",
+		mfaProvider: FileMFACodeProvider{Immediate: "123456"},
+		publicHTTP:  httpClient,
+		now:         func() time.Time { return time.Unix(1_700_000_000, 0) },
+		logger:      slog.New(slog.NewJSONHandler(&logs, nil)),
+	}
+	if err := client.Authenticate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if requestIndex != len(responses) {
+		t.Fatalf("made %d requests, want %d", requestIndex, len(responses))
+	}
+	output := logs.String()
+	for _, message := range []string{
+		"TP-Link terminal verification required",
+		"TP-Link verification email requested; waiting for code",
+		"TP-Link verification code received; completing terminal verification",
+		"TP-Link authentication completed",
+	} {
+		if !strings.Contains(output, message) {
+			t.Errorf("missing log message %q in %s", message, output)
+		}
+	}
+	for _, secret := range []string{"private@example.invalid", "secret-password", "123456", "secret-process", "secret-token", "secret-refresh"} {
+		if strings.Contains(output, secret) {
+			t.Errorf("secret %q appeared in logs", secret)
+		}
+	}
+}
+
+func TestDoJSONRedactsQueryParameters(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	request, err := http.NewRequest(http.MethodGet, "https://example.invalid/path?token=secret-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = doJSON(httpClient, request, &map[string]any{})
+	if err == nil {
+		t.Fatal("expected HTTP status error")
+	}
+	if strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "?token") {
+		t.Fatalf("query parameter leaked in error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "https://example.invalid/path") {
+		t.Fatalf("safe request URL missing from error: %v", err)
 	}
 }

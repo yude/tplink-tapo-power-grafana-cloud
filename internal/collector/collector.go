@@ -69,10 +69,11 @@ func (c *Collector) Collect(ctx context.Context, includeHistory bool) (Result, e
 	result := Result{DevicesSelected: len(selected)}
 	for _, thing := range selected {
 		succeeded := 0
+		methodErrors := make([]string, 0, len(currentMethods))
 		for _, method := range currentMethods {
 			payload, callErr := c.tapo.Call(ctx, thing, method, nil)
 			if callErr != nil {
-				c.logger.Debug("Tapo energy method unavailable", "device", safe(thing.Name()), "method", method, "error", safe(callErr.Error()))
+				methodErrors = append(methodErrors, method+": "+safe(callErr.Error()))
 				continue
 			}
 			succeeded++
@@ -84,7 +85,7 @@ func (c *Collector) Collect(ctx context.Context, includeHistory bool) (Result, e
 		} else {
 			result.DevicesFailed++
 			c.statusMetrics(&batch, thing, now, false)
-			c.logger.Error("Tapo energy collection failed", "device", safe(thing.Name()))
+			c.logger.Error("Tapo energy collection failed", "device", safe(thing.Name()), "method_errors", methodErrors)
 		}
 		if includeHistory {
 			c.collectHistory(ctx, &batch, thing, now)
@@ -97,6 +98,9 @@ func (c *Collector) Collect(ctx context.Context, includeHistory bool) (Result, e
 		return result, err
 	}
 	result.PointsSent = batch.Len()
+	if result.DevicesSucceeded == 0 {
+		return result, fmt.Errorf("all %d selected Tapo devices failed energy reads", result.DevicesSelected)
+	}
 	return result, nil
 }
 

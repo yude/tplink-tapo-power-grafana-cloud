@@ -83,7 +83,7 @@ func run(logger *slog.Logger) error {
 	}
 	tapoClient, err := tapo.NewClient(
 		cfg.TapoUsername, cfg.TapoPassword, cfg.TapoTerminalID,
-		provider, cfg.RequestTimeout,
+		provider, cfg.RequestTimeout, logger,
 	)
 	if err != nil {
 		return err

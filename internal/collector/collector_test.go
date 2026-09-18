@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 
 type fakeTapo struct {
 	methods []string
+	failAll bool
 }
 
 func (f *fakeTapo) ListThings(context.Context) ([]tapo.Thing, error) {
@@ -24,10 +26,26 @@ func (f *fakeTapo) ListThings(context.Context) ([]tapo.Thing, error) {
 
 func (f *fakeTapo) Call(_ context.Context, _ tapo.Thing, method string, _ any) (map[string]any, error) {
 	f.methods = append(f.methods, method)
-	if method == "get_energy_usage" {
+	if method == "get_energy_usage" && !f.failAll {
 		return map[string]any{"current_power": float64(1250), "today_energy": float64(10)}, nil
 	}
 	return nil, errors.New("unsupported")
+}
+
+func TestCollectReturnsErrorWhenEveryEnergyReadFails(t *testing.T) {
+	api := &fakeTapo{failAll: true}
+	sink := &fakeSink{}
+	collector := New(api, sink, nil, time.UTC, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := collector.Collect(context.Background(), false)
+	if err == nil || !strings.Contains(err.Error(), "all 1 selected Tapo devices failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.DevicesSucceeded != 0 || result.DevicesFailed != 1 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if len(sink.points) != 2 {
+		t.Fatalf("failure status metrics were not pushed: %#v", sink.points)
+	}
 }
 
 type fakeSink struct{ points []metric.Point }

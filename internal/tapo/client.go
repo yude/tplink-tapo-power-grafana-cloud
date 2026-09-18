@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -52,6 +53,7 @@ type Client struct {
 	publicHTTP  *http.Client
 	thingHTTP   *http.Client
 	now         func() time.Time
+	logger      *slog.Logger
 	session     *session
 }
 
@@ -118,7 +120,7 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("%s failed (%d): %s", e.Operation, e.Code, e.Message)
 }
 
-func NewClient(username, password, terminalID string, provider MFACodeProvider, timeout time.Duration) (*Client, error) {
+func NewClient(username, password, terminalID string, provider MFACodeProvider, timeout time.Duration, logger *slog.Logger) (*Client, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(tpLinkCloudServerCA) {
 		return nil, errors.New("parse embedded TP-Link Cloud Server CA")
@@ -139,6 +141,7 @@ func NewClient(username, password, terminalID string, provider MFACodeProvider, 
 		publicHTTP:  &http.Client{Timeout: timeout, CheckRedirect: redirect},
 		thingHTTP:   &http.Client{Timeout: timeout, CheckRedirect: redirect, Transport: transport},
 		now:         time.Now,
+		logger:      logger,
 	}, nil
 }
 
@@ -178,7 +181,9 @@ func (c *Client) Authenticate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if apiCode(login) == mfaRequiredCode {
+	mfaRequired := apiCode(login) == mfaRequiredCode
+	if mfaRequired {
+		c.info("TP-Link terminal verification required")
 		login, err = c.completeMFA(ctx, regionalURL, login)
 		if err != nil {
 			return err
@@ -196,6 +201,7 @@ func (c *Client) Authenticate(ctx context.Context) error {
 		Token:        token,
 		RefreshToken: stringAt(login, "result", "refreshToken"),
 	}
+	c.info("TP-Link authentication completed", "terminal_verification", mfaRequired)
 	return nil
 }
 
@@ -227,10 +233,12 @@ func (c *Client) completeMFA(ctx context.Context, regionalURL string, login map[
 	if err := checkAPI(sent, "email terminal verification code request"); err != nil {
 		return nil, err
 	}
+	c.info("TP-Link verification email requested; waiting for code")
 	code, err := c.mfaProvider.WaitCode(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("wait for TP-Link email verification code: %w", err)
 	}
+	c.info("TP-Link verification code received; completing terminal verification")
 	verified, err := c.signedPost(ctx, c.publicHTTP, regionalURL,
 		"/api/v2/account/checkMFACodeAndLogin", map[string]any{
 			"appType":             accountAppName,
@@ -244,6 +252,12 @@ func (c *Client) completeMFA(ctx context.Context, regionalURL string, login map[
 		return nil, err
 	}
 	return verified, nil
+}
+
+func (c *Client) info(message string, args ...any) {
+	if c.logger != nil {
+		c.logger.Info(message, args...)
+	}
 }
 
 func (c *Client) ListThings(ctx context.Context) ([]Thing, error) {
@@ -452,7 +466,11 @@ func (c *Client) thingJSON(ctx context.Context, method, endpoint string, body an
 func doJSON(client *http.Client, req *http.Request, target any) error {
 	response, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", req.Method, req.URL.Redacted(), err)
+		var urlError *url.Error
+		if errors.As(err, &urlError) {
+			err = urlError.Err
+		}
+		return fmt.Errorf("%s %s: %w", req.Method, requestURL(req), err)
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
@@ -460,12 +478,20 @@ func doJSON(client *http.Client, req *http.Request, target any) error {
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("%s %s returned HTTP %d", req.Method, req.URL.Redacted(), response.StatusCode)
+		return fmt.Errorf("%s %s returned HTTP %d", req.Method, requestURL(req), response.StatusCode)
 	}
 	if err := json.Unmarshal(body, target); err != nil {
-		return fmt.Errorf("decode %s %s response: %w", req.Method, req.URL.Redacted(), err)
+		return fmt.Errorf("decode %s %s response: %w", req.Method, requestURL(req), err)
 	}
 	return nil
+}
+
+func requestURL(req *http.Request) string {
+	value := *req.URL
+	value.RawQuery = ""
+	value.ForceQuery = false
+	value.Fragment = ""
+	return value.Redacted()
 }
 
 func normalizePublicHost(raw string) (string, error) {
