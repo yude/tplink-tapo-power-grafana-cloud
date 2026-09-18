@@ -186,7 +186,9 @@ func TestDoJSONRedactsQueryParameters(t *testing.T) {
 
 func TestCallSendsDocumentedPassthroughEnvelope(t *testing.T) {
 	var requestBody map[string]any
+	var requestHeaders http.Header
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestHeaders = request.Header.Clone()
 		if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil {
 			t.Fatal(err)
 		}
@@ -226,5 +228,21 @@ func TestCallSendsDocumentedPassthroughEnvelope(t *testing.T) {
 	inner, _ := requests[0].(map[string]any)
 	if inner["method"] != "get_current_power" {
 		t.Fatalf("unexpected inner request: %#v", inner)
+	}
+	for name, want := range map[string]string{
+		"App-Cid":       "app:TP-Link_Tapo_Android:00000000-0000-4000-8000-000000000001",
+		"X-App-Name":    "TP-Link_Tapo_Android",
+		"X-App-Version": "3.13.818",
+		"X-Ospf":        "Android 15",
+		"X-Net-Type":    "wifi",
+		"X-Strict":      "0",
+		"X-Locale":      "en_US",
+	} {
+		if got := requestHeaders.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if strings.Contains(requestHeaders.Get("User-Agent"), "secret-token") {
+		t.Fatal("token leaked into User-Agent")
 	}
 }

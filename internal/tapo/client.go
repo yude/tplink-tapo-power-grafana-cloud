@@ -22,8 +22,8 @@ const (
 	initialHost       = "https://wap.tplinkcloud.com"
 	accountAppName    = "TP-Link_Tapo_Android"
 	accountAppVersion = "3.4.451"
-	thingAppName      = "Tapo_Android"
-	thingAppVersion   = "3.19.607"
+	thingAppName      = "TP-Link_Tapo_Android"
+	thingAppVersion   = "3.13.818"
 	mfaRequiredCode   = -20677
 )
 
@@ -457,10 +457,14 @@ func (c *Client) thingJSON(ctx context.Context, method, endpoint string, body an
 	req.Header.Set("x-app-name", thingAppName)
 	req.Header.Set("x-app-version", thingAppVersion)
 	req.Header.Set("x-term-id", c.terminalID)
-	req.Header.Set("x-app-ospf", "Android")
+	req.Header.Set("x-ospf", "Android 15")
+	req.Header.Set("x-net-type", "wifi")
+	req.Header.Set("x-strict", "0")
+	req.Header.Set("x-locale", "en_US")
 	req.Header.Set("x-app-brand", "TPLINK")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+	req.Header.Set("User-Agent", thingAppName+"/"+thingAppVersion+"(Kubernetes/;Android 15)")
 	return doJSON(c.thingHTTP, req, target)
 }
 
