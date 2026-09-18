@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yude/tplink-tapo-power-grafana-cloud-gas/internal/metric"
+	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/metric"
 )
 
 func TestPushUsesBasicAuthentication(t *testing.T) {

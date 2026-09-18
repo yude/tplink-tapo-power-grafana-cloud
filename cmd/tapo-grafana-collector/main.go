@@ -13,10 +13,10 @@ import (
 	"time"
 	_ "time/tzdata"
 
-	"github.com/yude/tplink-tapo-power-grafana-cloud-gas/internal/collector"
-	"github.com/yude/tplink-tapo-power-grafana-cloud-gas/internal/config"
-	"github.com/yude/tplink-tapo-power-grafana-cloud-gas/internal/otlp"
-	"github.com/yude/tplink-tapo-power-grafana-cloud-gas/internal/tapo"
+	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/collector"
+	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/config"
+	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/otlp"
+	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/tapo"
 )
 
 var version = "dev"

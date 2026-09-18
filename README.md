@@ -2,8 +2,7 @@
 
 TP-Link Cloud から Tapo スマートプラグの電力情報を読み取り、Grafana Cloud の
 OTLP/HTTP エンドポイントへ送信する Go 製デーモンです。Kubernetes 上で常駐させる
-ことを前提にしています。リポジトリ名の `-gas` は旧 Google Apps Script 版からの
-履歴上の名称で、現行版に Apps Script のコードやランタイム依存はありません。
+ことを前提にしています。現行版に Apps Script のコードやランタイム依存はありません。
 
 このアプリケーションは読み取り専用です。電源 ON/OFF、トグル、設定変更などの
 デバイス操作 API は実装していません。
@@ -129,8 +128,8 @@ go run ./cmd/tapo-grafana-collector
 `main` への push と `v*` tag の push でテスト後に次のイメージを GHCR へ公開します。
 
 ```text
-ghcr.io/yude/tplink-tapo-power-grafana-cloud-gas:<git-short-sha>
-ghcr.io/yude/tplink-tapo-power-grafana-cloud-gas:main
+ghcr.io/yude/tplink-tapo-power-grafana-cloud:<git-short-sha>
+ghcr.io/yude/tplink-tapo-power-grafana-cloud:main
 ```
 
 リリース tag では semver tag も付与します。最終イメージは static binary だけを含む

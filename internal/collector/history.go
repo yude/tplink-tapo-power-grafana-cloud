@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/yude/tplink-tapo-power-grafana-cloud-gas/internal/metric"
-	"github.com/yude/tplink-tapo-power-grafana-cloud-gas/internal/tapo"
+	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/metric"
+	"github.com/yude/tplink-tapo-power-grafana-cloud/internal/tapo"
 )
 
 type historyWindow struct {
