@@ -5,7 +5,7 @@
  * It intentionally contains no relay, toggle, or device mutation methods.
  */
 
-var TAPO_GRAFANA_VERSION = '0.1.9';
+var TAPO_GRAFANA_VERSION = '0.2.0';
 
 var TAPO_CLOUD = Object.freeze({
   initialHost: 'https://wap.tplinkcloud.com',
@@ -68,21 +68,16 @@ function runCollection() {
     var failed = 0;
 
     devices.forEach(function (device) {
-      addDeviceOnlineMetric_(batch, device);
-      if (deviceOnlineState_(device) === false && !config.includeOffline) {
-        addCollectionMetric_(batch, device, false);
-        failed += 1;
-        return;
-      }
-
       try {
         var payloads = collectCurrentEnergy_(config, session, device);
         payloads.forEach(function (entry) {
           extractEnergyMetrics_(batch, device, entry.source, entry.payload, batch.timestampMs);
         });
+        addDeviceOnlineMetric_(batch, device, true);
         addCollectionMetric_(batch, device, true);
         succeeded += 1;
       } catch (error) {
+        addDeviceOnlineMetric_(batch, device, false);
         addCollectionMetric_(batch, device, false);
         failed += 1;
         console.error('Energy collection failed for ' + safeDeviceName_(device) + ': ' + safeError_(error));
@@ -449,9 +444,7 @@ function selectEnergyDevices_(devices, config) {
 }
 
 function selectBackfillDevices_(devices, config) {
-  return selectEnergyDevices_(devices, config).filter(function (device) {
-    return deviceOnlineState_(device) !== false;
-  });
+  return selectEnergyDevices_(devices, config);
 }
 
 function deviceKind_(device) {
@@ -463,8 +456,7 @@ function deviceModel_(device) {
 }
 
 function deviceOnlineState_(device) {
-  var value = device.status;
-  if (value === undefined || value === null) value = device.deviceStatus;
+  var value = device.deviceStatus;
   if (value === undefined || value === null) value = device.online;
   if (value === undefined || value === null) return null;
   if (value === true || Number(value) === 1) return true;
@@ -480,12 +472,13 @@ function deviceSelectionDiagnostics_(discovered, selected, config) {
     discoveredCount: discovered.length,
     selectedCount: selected.length,
     configuredDeviceIdCount: config.deviceIds.length,
-    includeOfflinePolling: config.includeOffline,
+    pollsAllSelectedDevices: true,
     devices: discovered.slice(0, 50).map(function (device) {
       var state = deviceOnlineState_(device);
       return {
         type: sanitizeText_(deviceKind_(device) || 'unknown'),
         model: sanitizeText_(deviceModel_(device) || 'unknown'),
+        rawStatus: device.status === undefined ? 'absent' : sanitizeText_(device.status),
         online: state === null ? 'unknown' : state,
         selected: selected.indexOf(device) !== -1
       };
@@ -707,10 +700,8 @@ function deviceAttributes_(device, source) {
   return attributes;
 }
 
-function addDeviceOnlineMetric_(batch, device) {
-  var online = deviceOnlineState_(device);
-  if (online === null) return;
-  addMetricPoint_(batch, 'tapo_device_online', '1', 'Whether TP-Link Cloud reports the device online',
+function addDeviceOnlineMetric_(batch, device, online) {
+  addMetricPoint_(batch, 'tapo_device_online', '1', 'Whether the energy collector could reach the device',
     online ? 1 : 0, deviceAttributes_(device), batch.timestampMs);
 }
 
