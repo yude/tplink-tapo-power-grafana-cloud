@@ -197,7 +197,7 @@ func TestReadUsageUsesDedicatedReadOnlyEndpoint(t *testing.T) {
 	result, err := client.ReadUsage(context.Background(), Thing{
 		ThingName:      "thing-1",
 		AppServerURLV2: "https://aps1-app-server.iot.i.tplinkcloud.com",
-	})
+	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,5 +252,62 @@ func TestReadShadowReturnsOnlyReportedState(t *testing.T) {
 	}
 	if _, leaked := reported["desired"]; leaked {
 		t.Fatalf("desired state leaked into reported data: %#v", reported)
+	}
+}
+
+func TestReadUsageFallsBackToLocalEnergyAPIAndCachesDecision(t *testing.T) {
+	requests := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		body := `{"ip":"192.168.30.50"}`
+		status := http.StatusOK
+		if request.URL.Path == "/v1/things/thing-1/usage" {
+			status = http.StatusRequestTimeout
+			body = `{"code":12202,"message":"exceed max timeout milliseconds : 10000"}`
+		} else if request.URL.Path != "/v1/things/thing-1/details" {
+			t.Fatalf("unexpected endpoint: %s", request.URL)
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	localReads := 0
+	client := &Client{
+		terminalID: "00000000-0000-4000-8000-000000000001",
+		thingHTTP:  httpClient,
+		session:    &session{Token: "secret-token"},
+		localIPs:   make(map[string]string), preferLocal: make(map[string]bool),
+		localRead: func(_ context.Context, ip string, history bool) (map[string]any, error) {
+			localReads++
+			if ip != "192.168.30.50" || !history {
+				t.Fatalf("unexpected local read: ip=%q history=%v", ip, history)
+			}
+			return map[string]any{"energy_usage": map[string]any{"current_power": float64(1250)}}, nil
+		},
+	}
+	thing := Thing{ThingName: "thing-1", AppServerURLV2: "https://aps1-app-server.iot.i.tplinkcloud.com"}
+	for index := 0; index < 2; index++ {
+		result, err := client.ReadUsage(context.Background(), thing, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := result["energy_usage"]; !ok {
+			t.Fatalf("unexpected result: %#v", result)
+		}
+	}
+	if requests != 2 {
+		t.Fatalf("cloud requests = %d, want one usage and one details request", requests)
+	}
+	if localReads != 2 {
+		t.Fatalf("local reads = %d, want 2", localReads)
+	}
+}
+
+func TestValidPrivateIPRejectsCloudControlledPublicAddresses(t *testing.T) {
+	for _, invalid := range []string{"", "127.0.0.1", "0.0.0.0", "8.8.8.8", "not-an-ip"} {
+		if got := validPrivateIP(invalid); got != "" {
+			t.Fatalf("validPrivateIP(%q) = %q", invalid, got)
+		}
+	}
+	if got := validPrivateIP("192.168.30.50"); got != "192.168.30.50" {
+		t.Fatalf("private address rejected: %q", got)
 	}
 }

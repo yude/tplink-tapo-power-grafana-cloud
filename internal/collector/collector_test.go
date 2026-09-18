@@ -23,7 +23,7 @@ func (f *fakeTapo) ListThings(context.Context) ([]tapo.Thing, error) {
 	}}, nil
 }
 
-func (f *fakeTapo) ReadUsage(_ context.Context, _ tapo.Thing) (map[string]any, error) {
+func (f *fakeTapo) ReadUsage(_ context.Context, _ tapo.Thing, _ bool) (map[string]any, error) {
 	if !f.failAll {
 		return map[string]any{"energy_usage": map[string]any{"current_power": float64(1250), "today_energy": float64(10)}}, nil
 	}

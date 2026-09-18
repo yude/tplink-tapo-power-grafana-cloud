@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -9,7 +10,7 @@ import (
 )
 
 var usageHistoryFields = map[string]struct{}{
-	"past24h": {}, "past7d": {}, "past30d": {}, "past1y": {},
+	"past24h": {}, "past7d": {}, "past30d": {}, "past1y": {}, "history": {},
 }
 
 func historyField(path []string) bool {
@@ -31,6 +32,42 @@ func (c *Collector) collectUsageHistory(batch *metric.Batch, thing tapo.Thing, u
 	addPowerHistory(batch, thing, "past7d", flattenNumbers(energy["past7d"]), anchor)
 	addEnergyHistory(batch, thing, "past30d", flattenNumbers(energy["past30d"]), anchor)
 	addEnergyHistory(batch, thing, "past1y", flattenNumbers(energy["past1y"]), anchor)
+	if history, ok := usage["history"].(map[string]any); ok {
+		for name, value := range history {
+			series, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			addKlapHistory(batch, thing, name, series, anchor)
+		}
+	}
+}
+
+func addKlapHistory(batch *metric.Batch, thing tapo.Thing, name string, series map[string]any, fallback time.Time) {
+	values := flattenNumbers(series["data"])
+	if len(values) == 0 {
+		return
+	}
+	start := fallback
+	if seconds, ok := floatNumber(series["start_timestamp"]); ok {
+		start = time.Unix(int64(seconds), 0).In(fallback.Location())
+	}
+	interval, ok := floatNumber(series["interval"])
+	if !ok || interval <= 0 {
+		return
+	}
+	resolution := fmt.Sprintf("%gm", interval)
+	metricName, unit, description := "tapo_energy_bucket_watt_hours", "Wh", "Energy consumed in a historical time bucket"
+	if strings.HasPrefix(name, "power_") {
+		metricName, unit, description = "tapo_power_bucket_watts", "W", "Average power in a historical time bucket"
+	}
+	for index, value := range values {
+		batch.Add(metric.Point{
+			Name: metricName, Unit: unit, Description: description, Value: value,
+			Timestamp:  start.Add(time.Duration(float64(index)*interval) * time.Minute),
+			Attributes: historyAttributes(thing, name, resolution),
+		})
+	}
 }
 
 func addPowerHistory(batch *metric.Batch, thing tapo.Thing, window string, values []float64, anchor time.Time) {

@@ -36,6 +36,12 @@ TLS 証明書とホスト名を検証します。証明書検証を無効化す�
 デバイスコマンドを中継する `services-sync` は使用しません。shadow は `desired` ではなく
 デバイス自身が返した `reported` だけを参照し、変更 API は実装していません。
 
+Cloud の `/usage` が機器到達 timeout になる場合は、読み取り専用の Thing details から
+プライベート LAN アドレスを解決し、KLAP の `get_energy_usage`、`get_current_power`、
+`get_emeter_data`、`get_energy_data`、`get_power_data` へ自動的にフォールバックします。
+公開 IP、loopback、unspecified address は拒否します。したがって collector の Pod から
+Tapo 機器の TCP port 80 へ到達できる必要があります。
+
 既知の値は SI 単位へ正規化します。未知の数値フィールドも捨てず、フィールドの
 JSON パスを `tapo.energy.field` 属性に持つ `tapo_energy_raw_value` として送信します。
 

@@ -17,7 +17,7 @@ import (
 
 type TapoClient interface {
 	ListThings(context.Context) ([]tapo.Thing, error)
-	ReadUsage(context.Context, tapo.Thing) (map[string]any, error)
+	ReadUsage(context.Context, tapo.Thing, bool) (map[string]any, error)
 	ReadShadow(context.Context, tapo.Thing) (map[string]any, error)
 }
 
@@ -63,7 +63,13 @@ func (c *Collector) Collect(ctx context.Context, includeHistory bool) (Result, e
 	for _, thing := range selected {
 		pointsBefore := batch.Len()
 		readErrors := make([]string, 0, 2)
-		usage, usageErr := c.tapo.ReadUsage(ctx, thing)
+		shadow, shadowErr := c.tapo.ReadShadow(ctx, thing)
+		if shadowErr != nil {
+			readErrors = append(readErrors, "shadow: "+safeError(shadowErr.Error()))
+		} else {
+			c.extract(&batch, thing, "thing_shadow", shadow, now, false)
+		}
+		usage, usageErr := c.tapo.ReadUsage(ctx, thing, includeHistory)
 		if usageErr != nil {
 			readErrors = append(readErrors, "usage: "+safeError(usageErr.Error()))
 		} else {
@@ -71,12 +77,6 @@ func (c *Collector) Collect(ctx context.Context, includeHistory bool) (Result, e
 			if includeHistory {
 				c.collectUsageHistory(&batch, thing, usage, now)
 			}
-		}
-		shadow, shadowErr := c.tapo.ReadShadow(ctx, thing)
-		if shadowErr != nil {
-			readErrors = append(readErrors, "shadow: "+safeError(shadowErr.Error()))
-		} else {
-			c.extract(&batch, thing, "thing_shadow", shadow, now, false)
 		}
 		if batch.Len() > pointsBefore {
 			result.DevicesSucceeded++

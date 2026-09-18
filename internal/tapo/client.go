@@ -11,11 +11,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	tapogo "github.com/tess1o/tapo-go"
 )
 
 const (
@@ -47,6 +51,10 @@ type Client struct {
 	now         func() time.Time
 	logger      *slog.Logger
 	session     *session
+	mu          sync.Mutex
+	localIPs    map[string]string
+	preferLocal map[string]bool
+	localRead   func(context.Context, string, bool) (map[string]any, error)
 }
 
 type session struct {
@@ -66,6 +74,7 @@ type Thing struct {
 	DeviceType     string `json:"deviceType"`
 	AppServerURLV2 string `json:"appServerUrlV2"`
 	Status         any    `json:"status"`
+	IP             string `json:"ip"`
 }
 
 func (t Thing) ID() string {
@@ -134,6 +143,8 @@ func NewClient(username, password, terminalID string, provider MFACodeProvider, 
 		thingHTTP:   &http.Client{Timeout: timeout, CheckRedirect: redirect, Transport: transport},
 		now:         time.Now,
 		logger:      logger,
+		localIPs:    make(map[string]string),
+		preferLocal: make(map[string]bool),
 	}, nil
 }
 
@@ -319,10 +330,29 @@ func (c *Client) ListThings(ctx context.Context) ([]Thing, error) {
 	return things, nil
 }
 
-func (c *Client) ReadUsage(ctx context.Context, thing Thing) (map[string]any, error) {
+func (c *Client) ReadUsage(ctx context.Context, thing Thing, includeHistory bool) (map[string]any, error) {
 	if err := c.Authenticate(ctx); err != nil {
 		return nil, err
 	}
+	if c.shouldPreferLocal(thing.ID()) {
+		if usage, err := c.readLocalUsage(ctx, thing, includeHistory); err == nil {
+			return usage, nil
+		}
+	}
+	usage, cloudErr := c.readCloudUsage(ctx, thing)
+	if cloudErr == nil {
+		return usage, nil
+	}
+	c.setPreferLocal(thing.ID())
+	usage, localErr := c.readLocalUsage(ctx, thing, includeHistory)
+	if localErr == nil {
+		c.info("TP-Link cloud usage unavailable; using local energy API", "device", thing.Name())
+		return usage, nil
+	}
+	return nil, fmt.Errorf("cloud usage: %v; local energy: %v", cloudErr, localErr)
+}
+
+func (c *Client) readCloudUsage(ctx context.Context, thing Thing) (map[string]any, error) {
 	host, err := normalizeThingHost(thing.AppServerURLV2)
 	if err != nil {
 		return nil, err
@@ -369,7 +399,168 @@ func (c *Client) ReadShadow(ctx context.Context, thing Thing) (map[string]any, e
 	if !ok {
 		return nil, errors.New("Thing shadow API returned no reported state")
 	}
+	c.rememberReportedIP(thing.ID(), reported)
 	return reported, nil
+}
+
+func (c *Client) readLocalUsage(ctx context.Context, thing Thing, includeHistory bool) (map[string]any, error) {
+	ip, err := c.localIP(ctx, thing)
+	if err != nil {
+		return nil, err
+	}
+	if c.localRead != nil {
+		return c.localRead(ctx, ip, includeHistory)
+	}
+	return c.readKlapEnergy(ctx, ip, includeHistory)
+}
+
+func (c *Client) localIP(ctx context.Context, thing Thing) (string, error) {
+	if ip := validPrivateIP(thing.IP); ip != "" {
+		c.storeLocalIP(thing.ID(), ip)
+		return ip, nil
+	}
+	c.mu.Lock()
+	cached := c.localIPs[thing.ID()]
+	c.mu.Unlock()
+	if cached != "" {
+		return cached, nil
+	}
+	host, err := normalizeThingHost(thing.AppServerURLV2)
+	if err != nil {
+		return "", err
+	}
+	var response map[string]any
+	endpoint := host + "/v1/things/" + url.PathEscape(thing.ID()) + "/details"
+	if err := c.thingJSON(ctx, http.MethodGet, endpoint, nil, &response); err != nil {
+		return "", fmt.Errorf("read Thing details: %w", err)
+	}
+	if code := apiCode(response); code != 0 {
+		return "", &APIError{Operation: "Thing details API", Code: code, Message: messageFrom(response)}
+	}
+	for _, candidate := range []string{
+		stringValue(response["ip"]),
+		stringAt(response, "data", "ip"),
+		stringAt(response, "result", "ip"),
+	} {
+		if ip := validPrivateIP(candidate); ip != "" {
+			c.storeLocalIP(thing.ID(), ip)
+			return ip, nil
+		}
+	}
+	return "", errors.New("Thing details API returned no private LAN address")
+}
+
+func (c *Client) readKlapEnergy(ctx context.Context, ip string, includeHistory bool) (map[string]any, error) {
+	client := &http.Client{Timeout: c.thingHTTP.Timeout}
+	plug, err := tapogo.NewSmartPlug(ctx, ip, c.username, c.password, tapogo.Options{
+		HttpClient: client,
+		RetryConfig: &tapogo.RetryConfig{
+			RetryDelay: 500 * time.Millisecond, RetryCount: 1, Retry403ErrorsOnly: true,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("KLAP handshake: %w", err)
+	}
+	result := make(map[string]any)
+	readErrors := make([]error, 0, 3)
+	if response, err := plug.GetEnergyUsage(ctx); err == nil && response.ErrorCode == 0 {
+		result["energy_usage"] = structMap(response.Result)
+	} else if err != nil {
+		readErrors = append(readErrors, fmt.Errorf("get_energy_usage: %w", err))
+	}
+	if response, err := plug.GetCurrentPower(ctx); err == nil && response.ErrorCode == 0 {
+		result["current_power"] = structMap(response.Result)
+	} else if err != nil {
+		readErrors = append(readErrors, fmt.Errorf("get_current_power: %w", err))
+	}
+	if response, err := plug.GetEmeterData(ctx); err == nil && response.ErrorCode == 0 {
+		result["emeter_data"] = structMap(response.Result)
+	} else if err != nil {
+		readErrors = append(readErrors, fmt.Errorf("get_emeter_data: %w", err))
+	}
+	if includeHistory {
+		result["history"] = c.readKlapHistory(ctx, plug)
+	}
+	if len(result) == 0 || (len(result) == 1 && result["history"] != nil) {
+		return nil, fmt.Errorf("all KLAP energy reads failed: %v", readErrors)
+	}
+	return result, nil
+}
+
+func (c *Client) readKlapHistory(ctx context.Context, plug *tapogo.SmartPlug) map[string]any {
+	now := c.now()
+	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	quarterMonth := time.Month(((int(now.Month()) - 1) / 3 * 3) + 1)
+	requests := []struct {
+		name   string
+		method string
+		params map[string]any
+	}{
+		{"power_5m", "get_power_data", map[string]any{"start_timestamp": now.Add(-12 * time.Hour).Unix(), "end_timestamp": now.Unix(), "interval": 5}},
+		{"power_hourly", "get_power_data", map[string]any{"start_timestamp": now.AddDate(0, 0, -6).Unix(), "end_timestamp": now.Unix(), "interval": 60}},
+		{"energy_hourly", "get_energy_data", map[string]any{"start_timestamp": startOfDay.Unix(), "end_timestamp": startOfDay.AddDate(0, 0, 1).Add(-time.Second).Unix(), "interval": 60}},
+		{"energy_daily", "get_energy_data", map[string]any{"start_timestamp": time.Date(now.Year(), quarterMonth, 1, 0, 0, 0, 0, now.Location()).Unix(), "end_timestamp": time.Date(now.Year(), quarterMonth, 1, 0, 0, 0, 0, now.Location()).Unix(), "interval": 1440}},
+		{"energy_monthly", "get_energy_data", map[string]any{"start_timestamp": time.Date(now.Year(), 1, 1, 0, 0, 0, 0, now.Location()).Unix(), "end_timestamp": time.Date(now.Year(), 1, 1, 0, 0, 0, 0, now.Location()).Unix(), "interval": 43200}},
+	}
+	history := make(map[string]any)
+	for _, request := range requests {
+		params, _ := json.Marshal(request.params)
+		var response map[string]any
+		if err := plug.ExecuteMethod(ctx, request.method, params, &response); err == nil && apiCode(response) == 0 {
+			if payload, ok := response["result"].(map[string]any); ok {
+				history[request.name] = payload
+			}
+		}
+	}
+	return history
+}
+
+func structMap(value any) map[string]any {
+	payload, _ := json.Marshal(value)
+	result := make(map[string]any)
+	_ = json.Unmarshal(payload, &result)
+	return result
+}
+
+func (c *Client) rememberReportedIP(thingID string, reported map[string]any) {
+	for _, key := range []string{"ip", "device_ip", "local_ip"} {
+		if ip := validPrivateIP(stringValue(reported[key])); ip != "" {
+			c.storeLocalIP(thingID, ip)
+			return
+		}
+	}
+}
+
+func (c *Client) storeLocalIP(thingID, ip string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.localIPs == nil {
+		c.localIPs = make(map[string]string)
+	}
+	c.localIPs[thingID] = ip
+}
+
+func (c *Client) shouldPreferLocal(thingID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.preferLocal[thingID]
+}
+
+func (c *Client) setPreferLocal(thingID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.preferLocal == nil {
+		c.preferLocal = make(map[string]bool)
+	}
+	c.preferLocal[thingID] = true
+}
+
+func validPrivateIP(value string) string {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if ip == nil || !ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() {
+		return ""
+	}
+	return ip.String()
 }
 
 func (c *Client) signedPost(ctx context.Context, client *http.Client, host, path string, body map[string]any, token, appName, appVersion string) (map[string]any, error) {
