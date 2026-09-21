@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -62,6 +64,7 @@ func (s *healthState) handler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log.SetOutput(io.Discard)
 	if err := run(logger); err != nil {
 		logger.Error("collector stopped", "error", err)
 		os.Exit(1)

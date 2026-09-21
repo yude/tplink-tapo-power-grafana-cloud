@@ -461,6 +461,13 @@ func (c *Client) readKlapEnergy(ctx context.Context, ip string, includeHistory b
 	if err != nil {
 		return nil, fmt.Errorf("KLAP handshake: %w", err)
 	}
+	readyTimer := time.NewTimer(time.Second)
+	defer readyTimer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-readyTimer.C:
+	}
 	result := make(map[string]any)
 	readErrors := make([]error, 0, 3)
 	if response, err := plug.GetEnergyUsage(ctx); err == nil && response.ErrorCode == 0 {
